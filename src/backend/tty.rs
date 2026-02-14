@@ -70,11 +70,12 @@ use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
-const SUPPORTED_COLOR_FORMATS: [Fourcc; 8] = [
-    Fourcc::Xrgb2101010,
-    Fourcc::Xbgr2101010,
-    Fourcc::Argb2101010,
+const SUPPORTED_COLOR_FORMATS: [Fourcc; 6] = [
+    // 10-bit formats must be BGR order — Smithay's GlesRenderer only maps
+    // Abgr2101010/Xbgr2101010 to GL_RGB10_A2. The RGB variants (Argb2101010,
+    // Xrgb2101010) have no GL format mapping and will crash the renderer.
     Fourcc::Abgr2101010,
+    Fourcc::Xbgr2101010,
     Fourcc::Xrgb8888,
     Fourcc::Xbgr8888,
     Fourcc::Argb8888,
@@ -1410,7 +1411,7 @@ impl Tty {
             Some(niri_config::ColorDepth::Depth8) => SUPPORTED_COLOR_FORMATS
                 .iter()
                 .copied()
-                .filter(|f| !matches!(f, Fourcc::Xrgb2101010 | Fourcc::Xbgr2101010 | Fourcc::Argb2101010 | Fourcc::Abgr2101010))
+                .filter(|f| !matches!(f, Fourcc::Abgr2101010 | Fourcc::Xbgr2101010))
                 .collect(),
             _ => SUPPORTED_COLOR_FORMATS.to_vec(),
         };
