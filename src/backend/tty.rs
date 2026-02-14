@@ -70,7 +70,11 @@ use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
-const SUPPORTED_COLOR_FORMATS: [Fourcc; 4] = [
+const SUPPORTED_COLOR_FORMATS: [Fourcc; 8] = [
+    Fourcc::Xrgb2101010,
+    Fourcc::Xbgr2101010,
+    Fourcc::Argb2101010,
+    Fourcc::Abgr2101010,
     Fourcc::Xrgb8888,
     Fourcc::Xbgr8888,
     Fourcc::Argb8888,
@@ -381,6 +385,14 @@ struct Surface {
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
+    /// Whether this surface has color management active (ICC profile or protocol).
+    /// When true, HDR properties are not reset on this connector.
+    color_managed: bool,
+    /// Parsed ICC color profile and LUT for this output.
+    color_profile: Option<crate::color::OutputColorProfile>,
+    /// Color information extracted from the EDID. Used by the color management protocol.
+    #[allow(dead_code)]
+    edid_color_info: Option<crate::color::EdidColorInfo>,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -669,16 +681,18 @@ impl Tty {
                     // Apply pending gamma changes and restore our existing gamma.
                     let device = self.devices.get_mut(&node).unwrap();
                     for (crtc, surface) in device.surfaces.iter_mut() {
-                        if let Ok(props) =
-                            ConnectorProperties::try_new(&device.drm, surface.connector)
-                        {
-                            match reset_hdr(&props) {
-                                Ok(()) => (),
-                                Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
-                            }
-                        } else {
-                            warn!("failed to get connector properties");
-                        };
+                        if !surface.color_managed {
+                            if let Ok(props) =
+                                ConnectorProperties::try_new(&device.drm, surface.connector)
+                            {
+                                match reset_hdr(&props) {
+                                    Ok(()) => (),
+                                    Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
+                                }
+                            } else {
+                                warn!("failed to get connector properties");
+                            };
+                        }
 
                         if let Some(ramp) = surface.pending_gamma_change.take() {
                             let ramp = ramp.as_deref();
@@ -1391,6 +1405,16 @@ impl Tty {
             })
             .collect::<FormatSet>();
 
+        // Filter color formats based on config.
+        let color_formats: Vec<Fourcc> = match config.color_depth {
+            Some(niri_config::ColorDepth::Depth8) => SUPPORTED_COLOR_FORMATS
+                .iter()
+                .copied()
+                .filter(|f| !matches!(f, Fourcc::Xrgb2101010 | Fourcc::Xbgr2101010 | Fourcc::Argb2101010 | Fourcc::Abgr2101010))
+                .collect(),
+            _ => SUPPORTED_COLOR_FORMATS.to_vec(),
+        };
+
         // Create the compositor.
         let res = DrmCompositor::new(
             OutputModeSource::Auto(output.clone()),
@@ -1398,7 +1422,7 @@ impl Tty {
             None,
             device.allocator.clone(),
             GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
-            SUPPORTED_COLOR_FORMATS,
+            color_formats.clone(),
             // This is only used to pick a good internal format, so it can use the surface's render
             // formats, even though we only ever render on the primary GPU.
             render_formats.clone(),
@@ -1428,7 +1452,7 @@ impl Tty {
                     None,
                     device.allocator.clone(),
                     GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
-                    SUPPORTED_COLOR_FORMATS,
+                    color_formats,
                     render_formats,
                     device.drm.cursor_size(),
                     Some(device.gbm.clone()),
@@ -1471,6 +1495,27 @@ impl Tty {
 
         let vrr_enabled = compositor.vrr_enabled();
 
+        // Load ICC profile if configured.
+        let color_profile = config.icc_profile.as_ref().and_then(|path| {
+            match crate::color::OutputColorProfile::from_icc(path) {
+                Ok(profile) => {
+                    debug!("loaded ICC profile for {connector_name}: {}", path.display());
+                    Some(profile)
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to load ICC profile for {connector_name}: {err:?}"
+                    );
+                    None
+                }
+            }
+        });
+
+        // Extract EDID color info.
+        let edid_color_info = get_edid_info(&device.drm, connector.handle())
+            .ok()
+            .and_then(|info| crate::color::edid_color_info(&info));
+
         let vblank_frame_name =
             tracy_client::FrameName::new_leak(format!("vblank on {connector_name}"));
         let time_since_presentation_plot_name = tracy_client::PlotName::new_leak(format!(
@@ -1489,6 +1534,9 @@ impl Tty {
             dmabuf_feedback,
             gamma_props,
             pending_gamma_change: None,
+            color_managed: color_profile.is_some(),
+            color_profile,
+            edid_color_info,
             vblank_frame: None,
             vblank_frame_name,
             time_since_presentation_plot_name,
@@ -1498,6 +1546,18 @@ impl Tty {
 
         let res = device.surfaces.insert(crtc, surface);
         assert!(res.is_none(), "crtc must not have already existed");
+
+        // Apply ICC gamma ramp if profile is loaded.
+        let surface = device.surfaces.get_mut(&crtc).unwrap();
+        if let (Some(gamma_props), Some(color_profile)) =
+            (&mut surface.gamma_props, &surface.color_profile)
+        {
+            if let Some(gamma) = &color_profile.gamma_ramp {
+                if let Err(err) = gamma_props.set_gamma(&device.drm, Some(gamma)) {
+                    warn!("error applying initial ICC gamma ramp for {connector_name}: {err:?}");
+                }
+            }
+        }
 
         niri.add_output(output.clone(), Some(refresh_interval(mode)), vrr_enabled);
 
@@ -2378,8 +2438,51 @@ impl Tty {
                 let change_always_vrr = vrr_enabled != config.is_vrr_always_on();
                 let is_on_demand_vrr = config.is_vrr_on_demand();
 
-                if !change_mode && !change_always_vrr && !is_on_demand_vrr {
+                // Check if the ICC profile changed.
+                let current_icc = surface.color_profile.is_some();
+                let icc_changed = match (&config.icc_profile, current_icc) {
+                    (Some(_), _) | (None, true) => true,
+                    (None, false) => false,
+                };
+
+                if !change_mode && !change_always_vrr && !is_on_demand_vrr && !icc_changed {
                     continue;
+                }
+
+                // Reload ICC profile if changed.
+                if icc_changed {
+                    let connector_name = &surface.name.connector;
+                    surface.color_profile = config.icc_profile.as_ref().and_then(|path| {
+                        match crate::color::OutputColorProfile::from_icc(path) {
+                            Ok(profile) => {
+                                debug!(
+                                    "reloaded ICC profile for {connector_name}: {}",
+                                    path.display()
+                                );
+                                Some(profile)
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "failed to reload ICC profile for {connector_name}: {err:?}"
+                                );
+                                None
+                            }
+                        }
+                    });
+                    surface.color_managed = surface.color_profile.is_some();
+
+                    // Apply gamma ramp fallback if profile loaded, or reset it.
+                    if let Some(gamma_props) = &mut surface.gamma_props {
+                        let gamma = surface
+                            .color_profile
+                            .as_ref()
+                            .and_then(|p| p.gamma_ramp.as_deref());
+                        if let Err(err) = gamma_props.set_gamma(&device.drm, gamma) {
+                            warn!(
+                                "error applying ICC gamma ramp for {connector_name}: {err:?}"
+                            );
+                        }
+                    }
                 }
 
                 let output = niri

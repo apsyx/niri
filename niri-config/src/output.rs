@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use knuffel::ast::SpannedNode;
@@ -9,6 +10,24 @@ use niri_ipc::{ConfiguredMode, HSyncPolarity, Transform, VSyncPolarity};
 
 use crate::gestures::HotCorners;
 use crate::{Color, FloatOrInt, LayoutPart};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorDepth {
+    Depth8,
+    Depth10,
+}
+
+impl FromStr for ColorDepth {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "8" => Ok(Self::Depth8),
+            "10" => Ok(Self::Depth10),
+            _ => Err(r#"valid values are "8" and "10""#),
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Outputs(pub Vec<Output>);
@@ -72,6 +91,10 @@ pub struct Output {
     pub background_color: Option<Color>,
     #[knuffel(child)]
     pub backdrop_color: Option<Color>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub color_depth: Option<ColorDepth>,
+    #[knuffel(child, unwrap(argument))]
+    pub icc_profile: Option<PathBuf>,
     #[knuffel(child)]
     pub hot_corners: Option<HotCorners>,
     #[knuffel(child)]
@@ -106,6 +129,8 @@ impl Default for Output {
             variable_refresh_rate: None,
             background_color: None,
             backdrop_color: None,
+            color_depth: None,
+            icc_profile: None,
             hot_corners: None,
             layout: None,
         }

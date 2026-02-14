@@ -73,9 +73,10 @@ futures-util = { version = "0.3.31", default-features = false, features = ["std"
 git-version = "0.3.9"
 glam = "0.30.10"
 input = { version = "0.9.1", features = ["libinput_1_21"] }
+lcms2 = "6"
 keyframe = { version = "1.1.1", default-features = false }
 libc = "0.2.180"
-libdisplay-info = "0.3.0"
+libdisplay-info = { version = "0.3.0", features = ["v0_2"] }
 log = { version = "0.4.29", features = ["max_level_trace", "release_max_level_debug"] }
 niri-config = { version = "25.11.0", path = "niri-config" }
 niri-ipc = { version = "25.11.0", path = "niri-ipc", features = ["clap"] }
