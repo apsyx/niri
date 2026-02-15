@@ -23,6 +23,7 @@ use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Point, Rectangle, Serial};
+use smithay::desktop::utils::surface_primary_scanout_output;
 use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_lease::{
@@ -755,6 +756,16 @@ delegate_gamma_control!(State);
 impl ColorManagementHandler for State {
     fn color_management_state(&mut self) -> &mut ColorManagementState {
         &mut self.niri.color_management_state
+    }
+
+    fn get_surface_preferred_description(&self, surface: &WlSurface) -> ImageDescription {
+        let output = with_states(surface, |states| {
+            surface_primary_scanout_output(surface, states)
+        });
+        match output {
+            Some(output) => self.get_output_color_description(&output),
+            None => ImageDescription::Srgb,
+        }
     }
 
     fn get_output_color_description(&self, _output: &Output) -> ImageDescription {

@@ -2031,6 +2031,7 @@ impl Tty {
                 }
 
                 niri.update_primary_scanout_output(output, &res.states);
+                niri.notify_color_preferred_changed();
                 if let Some(dmabuf_feedback) = surface.dmabuf_feedback.as_ref() {
                     niri.send_dmabuf_feedbacks(output, dmabuf_feedback, &res.states);
                 }

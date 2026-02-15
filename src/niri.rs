@@ -143,7 +143,7 @@ use crate::layout::{
 use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
-use crate::protocols::color_management::ColorManagementState;
+use crate::protocols::color_management::{ColorManagementState, ImageDescription};
 use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
@@ -4702,6 +4702,79 @@ impl Niri {
                 },
             );
         }
+    }
+
+    pub fn notify_color_preferred_changed(&mut self) {
+        self.color_management_state
+            .notify_preferred_changed(|surface| {
+                let output = with_states(surface, |states| {
+                    surface_primary_scanout_output(surface, states)
+                });
+                match output {
+                    Some(ref _output) => {
+                        #[cfg(not(test))]
+                        {
+                            use crate::backend::tty::{
+                                OutputEdidColorInfo, OutputHdrConfig, OutputHdrEnabled,
+                            };
+                            use crate::protocols::color_management::{
+                                LuminanceRange, Primaries, TransferFunction,
+                            };
+
+                            let hdr_enabled = _output
+                                .user_data()
+                                .get::<OutputHdrEnabled>()
+                                .map(|h| h.0)
+                                .unwrap_or(false);
+
+                            let hdr_config = _output
+                                .user_data()
+                                .get::<OutputHdrConfig>()
+                                .and_then(|h| h.0);
+
+                            let edid = _output
+                                .user_data()
+                                .get::<OutputEdidColorInfo>()
+                                .and_then(|e| e.0.clone());
+
+                            let primaries = edid.map(|color_info| Primaries {
+                                r_x: color_info.red.0,
+                                r_y: color_info.red.1,
+                                g_x: color_info.green.0,
+                                g_y: color_info.green.1,
+                                b_x: color_info.blue.0,
+                                b_y: color_info.blue.1,
+                                w_x: color_info.white.0,
+                                w_y: color_info.white.1,
+                            });
+
+                            if hdr_enabled {
+                                let luminance = hdr_config.map(|cfg| LuminanceRange {
+                                    min: 0.005,
+                                    max: cfg.max_luminance as f64,
+                                    reference: cfg.reference_luminance as f64,
+                                });
+                                return ImageDescription::Parametric {
+                                    primaries,
+                                    tf: Some(TransferFunction::Pq),
+                                    luminance,
+                                };
+                            }
+
+                            if primaries.is_some() {
+                                return ImageDescription::Parametric {
+                                    primaries,
+                                    tf: Some(TransferFunction::Srgb),
+                                    luminance: None,
+                                };
+                            }
+                        }
+
+                        ImageDescription::Srgb
+                    }
+                    None => ImageDescription::Srgb,
+                }
+            });
     }
 
     pub fn send_frame_callbacks(&mut self, output: &Output) {

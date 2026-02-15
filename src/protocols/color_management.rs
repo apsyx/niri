@@ -40,7 +40,7 @@ fn next_image_desc_id() -> u32 {
 // --- Image description types ---
 
 /// Describes a color space / image description.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ImageDescription {
     Srgb,
     Icc {
@@ -53,7 +53,7 @@ pub enum ImageDescription {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Primaries {
     pub r_x: f64,
     pub r_y: f64,
@@ -74,7 +74,7 @@ pub enum TransferFunction {
     Hlg,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LuminanceRange {
     pub min: f64,
     pub max: f64,
@@ -103,6 +103,12 @@ impl Default for ImageDescription {
 
 // --- Protocol state ---
 
+struct FeedbackSurfaceEntry {
+    surface: WlSurface,
+    resource: WpColorManagementSurfaceFeedbackV1,
+    last_preferred: Option<ImageDescription>,
+}
+
 pub struct ColorManagementState {
     #[allow(dead_code)]
     display: DisplayHandle,
@@ -110,6 +116,8 @@ pub struct ColorManagementState {
     image_descriptions: HashMap<u32, ImageDescription>,
     /// The sRGB image description ID.
     srgb_id: u32,
+    /// Active feedback surfaces for preferred_changed tracking.
+    feedback_surfaces: Vec<FeedbackSurfaceEntry>,
 }
 
 pub struct ColorManagementGlobalData {
@@ -162,6 +170,7 @@ pub struct ParametricCreatorData {
 pub trait ColorManagementHandler {
     fn color_management_state(&mut self) -> &mut ColorManagementState;
     fn get_output_color_description(&self, output: &Output) -> ImageDescription;
+    fn get_surface_preferred_description(&self, surface: &WlSurface) -> ImageDescription;
     fn surface_color_changed(&mut self, surface: &WlSurface, desc: &SurfaceColorDescription);
 }
 
@@ -197,6 +206,7 @@ impl ColorManagementState {
             display: display.clone(),
             image_descriptions,
             srgb_id,
+            feedback_surfaces: Vec::new(),
         }
     }
 
@@ -210,6 +220,7 @@ impl ColorManagementState {
             display: display.clone(),
             image_descriptions,
             srgb_id,
+            feedback_surfaces: Vec::new(),
         }
     }
 
@@ -217,6 +228,34 @@ impl ColorManagementState {
         let id = next_image_desc_id();
         self.image_descriptions.insert(id, desc);
         id
+    }
+
+    /// Check all tracked feedback surfaces and send `preferred_changed` if the
+    /// preferred description for any surface has changed (e.g. because the surface
+    /// moved to a different output).
+    pub fn notify_preferred_changed(
+        &mut self,
+        get_preferred: impl Fn(&WlSurface) -> ImageDescription,
+    ) {
+        // Remove entries whose protocol resource has been destroyed.
+        self.feedback_surfaces
+            .retain(|e| e.resource.is_alive() && e.surface.is_alive());
+
+        for entry in &mut self.feedback_surfaces {
+            let desc = get_preferred(&entry.surface);
+
+            let changed = match &entry.last_preferred {
+                Some(prev) => *prev != desc,
+                None => true,
+            };
+
+            if changed {
+                entry.last_preferred = Some(desc.clone());
+                let id = next_image_desc_id();
+                self.image_descriptions.insert(id, desc);
+                entry.resource.preferred_changed(id);
+            }
+        }
     }
 }
 
@@ -325,12 +364,20 @@ where
                 );
             }
             wp_color_manager_v1::Request::GetSurfaceFeedback { id, surface } => {
-                data_init.init(
+                let resource = data_init.init(
                     id,
                     ColorManagementSurfaceFeedbackData {
                         surface: surface.clone(),
                     },
                 );
+                state
+                    .color_management_state()
+                    .feedback_surfaces
+                    .push(FeedbackSurfaceEntry {
+                        surface: surface.clone(),
+                        resource,
+                        last_preferred: None,
+                    });
             }
             wp_color_manager_v1::Request::CreateIccCreator { obj } => {
                 data_init.init(obj, IccCreatorData);
@@ -474,20 +521,25 @@ where
             wp_color_management_surface_feedback_v1::Request::GetPreferred {
                 image_description,
             } => {
-                // Return sRGB as the preferred description for now.
-                let srgb_id = state.color_management_state().srgb_id;
-                let desc = data_init.init(image_description, ImageDescriptionData { id: srgb_id });
-                desc.ready(srgb_id);
+                let desc = state.get_surface_preferred_description(&_data.surface);
+                let id = state.color_management_state().register_description(desc);
+                let img_desc = data_init.init(image_description, ImageDescriptionData { id });
+                img_desc.ready(id);
             }
             wp_color_management_surface_feedback_v1::Request::GetPreferredParametric {
                 image_description,
             } => {
-                // Return sRGB as the preferred parametric description for now.
-                let srgb_id = state.color_management_state().srgb_id;
-                let desc = data_init.init(image_description, ImageDescriptionData { id: srgb_id });
-                desc.ready(srgb_id);
+                let desc = state.get_surface_preferred_description(&_data.surface);
+                let id = state.color_management_state().register_description(desc);
+                let img_desc = data_init.init(image_description, ImageDescriptionData { id });
+                img_desc.ready(id);
             }
-            wp_color_management_surface_feedback_v1::Request::Destroy => (),
+            wp_color_management_surface_feedback_v1::Request::Destroy => {
+                state
+                    .color_management_state()
+                    .feedback_surfaces
+                    .retain(|e| e.resource != *_resource);
+            }
         }
     }
 }
