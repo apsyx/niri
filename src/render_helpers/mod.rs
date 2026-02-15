@@ -281,7 +281,7 @@ pub fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::
     frame.finish().context("error finishing frame")
 }
 
-fn render_elements(
+pub fn render_elements(
     renderer: &mut GlesRenderer,
     target: &mut GlesTarget,
     size: Size<i32, Physical>,

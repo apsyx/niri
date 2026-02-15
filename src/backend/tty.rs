@@ -31,10 +31,10 @@ use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
-use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, RendererSuper};
+use smithay::backend::renderer::{Bind, DebugFlags, ImportDma, ImportEgl, RendererSuper};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -53,7 +53,7 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{DeviceFd, Transform};
+use smithay::utils::{DeviceFd, Physical, Size, Transform};
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
@@ -414,6 +414,9 @@ struct Surface {
     hdr_enabled: bool,
     /// HDR configuration from the config file.
     hdr_config: Option<niri_config::output::HdrConfig>,
+    /// Cached offscreen textures for HDR tone mapping to avoid per-frame allocation.
+    /// (sdr_offscreen, tone_map_output, size).
+    hdr_textures: Option<(GlesTexture, GlesTexture, Size<i32, Physical>)>,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -1596,6 +1599,7 @@ impl Tty {
             edid_color_info,
             hdr_enabled: config.hdr.is_some(),
             hdr_config: config.hdr,
+            hdr_textures: None,
             vblank_frame: None,
             vblank_frame_name,
             time_since_presentation_plot_name,
@@ -1976,17 +1980,20 @@ impl Tty {
         // then apply tone mapping (sRGB→PQ) as a post-processing pass, and submit the
         // single tone-mapped texture to the DRM compositor.
         let hdr_enabled = surface.hdr_enabled;
-        let hdr_dst_max_lum = surface
-            .hdr_config
-            .as_ref()
-            .map(|c| c.max_luminance as f32)
-            .unwrap_or(400.0);
+        let hdr_config = surface.hdr_config;
+        // Use the swapchain format for tone map output (typically 10-bit for HDR).
+        let swapchain_format = surface.compositor.format();
 
         // Render the elements.
         let mut elements: Vec<OutputRenderElements<TtyRenderer<'_>>>;
         let mut hdr_elements_storage: Vec<OutputRenderElements<TtyRenderer<'_>>> = Vec::new();
 
         if hdr_enabled {
+            let hdr_config = hdr_config.unwrap();
+            // SDR reference white in cd/m² — this is the luminance that sRGB 1.0 maps to.
+            let src_max_lum = hdr_config.reference_luminance as f32;
+            let dst_max_lum = hdr_config.max_luminance as f32;
+
             // HDR path: render to offscreen GlesTexture, tone map, wrap as single element.
             let tone_mapped = (|| -> anyhow::Result<_> {
                 let output_mode = output.current_mode().unwrap();
@@ -1994,33 +2001,60 @@ impl Tty {
                 let output_size = output_transform.transform_size(output_mode.size);
                 let output_scale = output.current_scale().fractional_scale().into();
 
-                // Render all elements using GlesRenderer to an offscreen texture.
                 let gles = renderer.as_gles_renderer();
+
+                // Reuse cached textures if the size matches, otherwise reallocate.
+                let need_alloc = match &surface.hdr_textures {
+                    Some((_, _, cached_size)) => *cached_size != output_size,
+                    None => true,
+                };
+                if need_alloc {
+                    use smithay::backend::renderer::Offscreen;
+                    let sdr_size = output_size.to_logical(1).to_buffer(1, Transform::Normal);
+                    let sdr_tex: GlesTexture = gles
+                        .create_buffer(Fourcc::Abgr8888, sdr_size)
+                        .context("error creating SDR offscreen texture")?;
+                    let tm_tex: GlesTexture = gles
+                        .create_buffer(swapchain_format, sdr_size)
+                        .context("error creating tone map output texture")?;
+                    surface.hdr_textures = Some((sdr_tex, tm_tex, output_size));
+                }
+                let (sdr_texture, tm_texture, _) = surface.hdr_textures.as_ref().unwrap();
+
+                // Render all elements using GlesRenderer to the cached offscreen texture.
                 let gles_elements = niri.render::<GlesRenderer>(
                     gles,
                     output,
                     true,
                     RenderTarget::Output,
                 );
-                let (sdr_texture, _sync) = crate::render_helpers::render_to_texture(
-                    gles,
-                    output_size,
-                    output_scale,
-                    output_transform,
-                    Fourcc::Abgr8888,
-                    gles_elements.iter().rev(),
-                )
-                .context("error rendering to offscreen texture for HDR")?;
+
+                // Bind the cached SDR texture and render into it.
+                {
+                    let mut sdr_tex = sdr_texture.clone();
+                    let mut target = gles.bind(&mut sdr_tex)
+                        .context("error binding SDR offscreen texture")?;
+                    let _sync = crate::render_helpers::render_elements(
+                        gles,
+                        &mut target,
+                        output_size,
+                        output_scale,
+                        output_transform,
+                        gles_elements.iter().rev(),
+                    )
+                    .context("error rendering elements to offscreen texture")?;
+                }
 
                 // Apply tone mapping: sRGB (TF=0) → PQ (TF=1).
-                let tone_mapped = shaders::apply_tone_map(
+                shaders::apply_tone_map_to(
                     gles,
-                    &sdr_texture,
+                    sdr_texture,
+                    tm_texture,
                     output_size,
                     0,              // src_tf: sRGB
                     1,              // dst_tf: PQ
-                    80.0,           // src_max_lum: SDR reference white
-                    hdr_dst_max_lum,
+                    src_max_lum,
+                    dst_max_lum,
                     Mat3::IDENTITY,
                 )
                 .context("error applying tone map")?;
@@ -2028,7 +2062,7 @@ impl Tty {
                 // Wrap tone-mapped texture as a DRM element.
                 let buffer = crate::render_helpers::texture::TextureBuffer::from_texture(
                     gles,
-                    tone_mapped,
+                    tm_texture.clone(),
                     output_scale,
                     output_transform,
                     Vec::new(),
