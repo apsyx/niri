@@ -186,3 +186,6 @@ assets = [
     ["resources/niri.service", "/usr/lib/systemd/user/", "644"],
     ["resources/niri-shutdown.target", "/usr/lib/systemd/user/", "644"],
 ]
+
+[patch.crates-io]
+wayland-backend = { git = "https://github.com/apsyx/wayland-backend-patched.git", branch = "master" }
