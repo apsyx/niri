@@ -2,6 +2,53 @@ use std::path::Path;
 
 use anyhow::Context as _;
 
+/// Well-known primaries constants.
+pub const SRGB_PRIMARIES: Primaries = Primaries {
+    r_x: 0.64,
+    r_y: 0.33,
+    g_x: 0.30,
+    g_y: 0.60,
+    b_x: 0.15,
+    b_y: 0.06,
+    w_x: 0.3127,
+    w_y: 0.3290,
+};
+
+pub const BT2020_PRIMARIES: Primaries = Primaries {
+    r_x: 0.708,
+    r_y: 0.292,
+    g_x: 0.170,
+    g_y: 0.797,
+    b_x: 0.131,
+    b_y: 0.046,
+    w_x: 0.3127,
+    w_y: 0.3290,
+};
+
+pub const DISPLAY_P3_PRIMARIES: Primaries = Primaries {
+    r_x: 0.680,
+    r_y: 0.320,
+    g_x: 0.265,
+    g_y: 0.690,
+    b_x: 0.150,
+    b_y: 0.060,
+    w_x: 0.3127,
+    w_y: 0.3290,
+};
+
+/// CIE xy chromaticity primaries (used for color matrix computation).
+#[derive(Debug, Clone, Copy)]
+pub struct Primaries {
+    pub r_x: f64,
+    pub r_y: f64,
+    pub g_x: f64,
+    pub g_y: f64,
+    pub b_x: f64,
+    pub b_y: f64,
+    pub w_x: f64,
+    pub w_y: f64,
+}
+
 /// Size of each dimension in the 3D LUT (33^3 = 35,937 texels).
 pub const LUT_SIZE: usize = 33;
 
@@ -160,6 +207,247 @@ pub fn upload_3d_lut_texture(
             Ok(tex)
         })
         .context("failed to access GL context")?
+}
+
+/// Matches `struct hdr_metadata_infoframe` from `<drm/drm_mode.h>`.
+///
+/// display_primaries order: [0]=red, [1]=green, [2]=blue.
+/// Chromaticity values are CIE xy × 50,000.
+/// Luminance: max in cd/m², min in 0.0001 cd/m².
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HdrMetadataInfoframe {
+    pub eotf: u8,
+    pub metadata_type: u8,
+    pub display_primaries: [HdrPrimaryChromaticity; 3],
+    pub white_point: HdrPrimaryChromaticity,
+    pub max_display_mastering_luminance: u16,
+    pub min_display_mastering_luminance: u16,
+    pub max_cll: u16,
+    pub max_fall: u16,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HdrPrimaryChromaticity {
+    pub x: u16,
+    pub y: u16,
+}
+
+/// Matches `struct hdr_output_metadata` from `<drm/drm_mode.h>`.
+///
+/// The kernel struct is 30 bytes: 4 (metadata_type) + 26 (infoframe).
+/// We use `repr(C, packed)` to match the kernel layout exactly.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HdrOutputMetadata {
+    pub metadata_type: u32,
+    pub hdmi_metadata_type1: HdrMetadataInfoframe,
+}
+
+/// Build HDR output metadata for the DRM `HDR_OUTPUT_METADATA` connector property.
+///
+/// Uses HDMI Static Metadata Type 1 with SMPTE ST 2084 (PQ) EOTF.
+/// Primaries come from EDID when available, otherwise default to BT.2020.
+pub fn build_hdr_output_metadata(
+    edid: Option<&EdidColorInfo>,
+    max_luminance: u32,
+    min_luminance: u32,
+) -> HdrOutputMetadata {
+    let (r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y) = if let Some(e) = edid {
+        (e.red.0, e.red.1, e.green.0, e.green.1, e.blue.0, e.blue.1, e.white.0, e.white.1)
+    } else {
+        (
+            BT2020_PRIMARIES.r_x, BT2020_PRIMARIES.r_y,
+            BT2020_PRIMARIES.g_x, BT2020_PRIMARIES.g_y,
+            BT2020_PRIMARIES.b_x, BT2020_PRIMARIES.b_y,
+            BT2020_PRIMARIES.w_x, BT2020_PRIMARIES.w_y,
+        )
+    };
+
+    let to_chr = |x: f64, y: f64| HdrPrimaryChromaticity {
+        x: (x * 50000.0) as u16,
+        y: (y * 50000.0) as u16,
+    };
+
+    HdrOutputMetadata {
+        // HDMI_STATIC_METADATA_TYPE1
+        metadata_type: 0,
+        hdmi_metadata_type1: HdrMetadataInfoframe {
+            // SMPTE ST 2084 (PQ)
+            eotf: 2,
+            // Static Metadata Type 1
+            metadata_type: 0,
+            // [0]=red, [1]=green, [2]=blue
+            display_primaries: [
+                to_chr(r_x, r_y),
+                to_chr(g_x, g_y),
+                to_chr(b_x, b_y),
+            ],
+            white_point: to_chr(w_x, w_y),
+            max_display_mastering_luminance: max_luminance as u16,
+            // min_luminance is in 0.0001 cd/m² units.
+            min_display_mastering_luminance: min_luminance as u16,
+            max_cll: max_luminance as u16,
+            max_fall: (max_luminance / 4) as u16,
+        },
+    }
+}
+
+/// Compute a 3×3 gamut conversion matrix from source to destination primaries.
+///
+/// The matrix converts linear RGB in the source gamut to linear RGB in the
+/// destination gamut. Computation:
+///   dst_XYZ_to_RGB × Bradford_CAT × src_RGB_to_XYZ
+///
+/// Bradford chromatic adaptation is applied when source and destination
+/// white points differ. When they are the same (e.g. both D65), the
+/// adaptation matrix is the identity.
+pub fn gamut_conversion_matrix(src: &Primaries, dst: &Primaries) -> [[f32; 3]; 3] {
+    let src_mat = rgb_to_xyz_matrix(src);
+    let dst_mat = rgb_to_xyz_matrix(dst);
+    let dst_inv = invert_3x3_f64(dst_mat);
+
+    // Bradford chromatic adaptation transform.
+    let cat = bradford_cat(
+        xy_to_xyz(src.w_x, src.w_y),
+        xy_to_xyz(dst.w_x, dst.w_y),
+    );
+
+    // Result = dst_inv × cat × src_mat
+    let cat_src = mul_3x3_f64(cat, src_mat);
+    mul_3x3_f64_to_f32(dst_inv, cat_src)
+}
+
+/// Bradford chromatic adaptation matrix from source to destination white point.
+/// If white points are the same, returns identity.
+fn bradford_cat(src_w: [f64; 3], dst_w: [f64; 3]) -> [[f64; 3]; 3] {
+    // Bradford cone-response matrix.
+    const M: [[f64; 3]; 3] = [
+        [0.8951, 0.2664, -0.1614],
+        [-0.7502, 1.7135, 0.0367],
+        [0.0389, -0.0685, 1.0296],
+    ];
+
+    let src_cone = [
+        M[0][0] * src_w[0] + M[0][1] * src_w[1] + M[0][2] * src_w[2],
+        M[1][0] * src_w[0] + M[1][1] * src_w[1] + M[1][2] * src_w[2],
+        M[2][0] * src_w[0] + M[2][1] * src_w[1] + M[2][2] * src_w[2],
+    ];
+    let dst_cone = [
+        M[0][0] * dst_w[0] + M[0][1] * dst_w[1] + M[0][2] * dst_w[2],
+        M[1][0] * dst_w[0] + M[1][1] * dst_w[1] + M[1][2] * dst_w[2],
+        M[2][0] * dst_w[0] + M[2][1] * dst_w[1] + M[2][2] * dst_w[2],
+    ];
+
+    // Check if white points are effectively the same (skip adaptation).
+    let eps = 1e-10;
+    if (src_cone[0] - dst_cone[0]).abs() < eps
+        && (src_cone[1] - dst_cone[1]).abs() < eps
+        && (src_cone[2] - dst_cone[2]).abs() < eps
+    {
+        return [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+    }
+
+    // Scale matrix: diag(dst_cone / src_cone)
+    let scale = [
+        [dst_cone[0] / src_cone[0], 0.0, 0.0],
+        [0.0, dst_cone[1] / src_cone[1], 0.0],
+        [0.0, 0.0, dst_cone[2] / src_cone[2]],
+    ];
+
+    // M^-1 * scale * M
+    let m_inv = invert_3x3_f64(M);
+    let sm = mul_3x3_f64(scale, M);
+    mul_3x3_f64(m_inv, sm)
+}
+
+/// Build the RGB-to-XYZ matrix from primaries.
+fn rgb_to_xyz_matrix(p: &Primaries) -> [[f64; 3]; 3] {
+    // Convert xy chromaticity to XYZ (Y=1).
+    let r_xyz = xy_to_xyz(p.r_x, p.r_y);
+    let g_xyz = xy_to_xyz(p.g_x, p.g_y);
+    let b_xyz = xy_to_xyz(p.b_x, p.b_y);
+    let w_xyz = xy_to_xyz(p.w_x, p.w_y);
+
+    // M = [Rx Gx Bx; Ry Gy By; Rz Gz Bz]
+    let m = [
+        [r_xyz[0], g_xyz[0], b_xyz[0]],
+        [r_xyz[1], g_xyz[1], b_xyz[1]],
+        [r_xyz[2], g_xyz[2], b_xyz[2]],
+    ];
+
+    let m_inv = invert_3x3_f64(m);
+
+    // S = M^-1 * W
+    let s = [
+        m_inv[0][0] * w_xyz[0] + m_inv[0][1] * w_xyz[1] + m_inv[0][2] * w_xyz[2],
+        m_inv[1][0] * w_xyz[0] + m_inv[1][1] * w_xyz[1] + m_inv[1][2] * w_xyz[2],
+        m_inv[2][0] * w_xyz[0] + m_inv[2][1] * w_xyz[1] + m_inv[2][2] * w_xyz[2],
+    ];
+
+    // Result = M * diag(S)
+    [
+        [m[0][0] * s[0], m[0][1] * s[1], m[0][2] * s[2]],
+        [m[1][0] * s[0], m[1][1] * s[1], m[1][2] * s[2]],
+        [m[2][0] * s[0], m[2][1] * s[1], m[2][2] * s[2]],
+    ]
+}
+
+fn xy_to_xyz(x: f64, y: f64) -> [f64; 3] {
+    if y == 0.0 {
+        return [0.0, 0.0, 0.0];
+    }
+    [x / y, 1.0, (1.0 - x - y) / y]
+}
+
+fn invert_3x3_f64(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+
+    let inv_det = 1.0 / det;
+
+    [
+        [
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+        ],
+        [
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
+        ],
+        [
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+        ],
+    ]
+}
+
+fn mul_3x3_f64(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut r = [[0f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            r[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    r
+}
+
+fn mul_3x3_f64_to_f32(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f32; 3]; 3] {
+    let r = mul_3x3_f64(a, b);
+    [
+        [r[0][0] as f32, r[0][1] as f32, r[0][2] as f32],
+        [r[1][0] as f32, r[1][1] as f32, r[1][2] as f32],
+        [r[2][0] as f32, r[2][1] as f32, r[2][2] as f32],
+    ]
 }
 
 /// Extract color information from a parsed EDID using libdisplay-info.

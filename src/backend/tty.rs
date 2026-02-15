@@ -378,6 +378,18 @@ struct TtyOutputState {
     crtc: crtc::Handle,
 }
 
+/// Wrapper for storing EDID color info in output user_data.
+#[derive(Debug, Clone)]
+pub struct OutputEdidColorInfo(pub Option<crate::color::EdidColorInfo>);
+
+/// Whether HDR output mode is enabled on this output.
+#[derive(Debug, Clone, Copy)]
+pub struct OutputHdrEnabled(pub bool);
+
+/// HDR config for this output (if any).
+#[derive(Debug, Clone)]
+pub struct OutputHdrConfig(pub Option<niri_config::output::HdrConfig>);
+
 struct Surface {
     name: OutputName,
     compositor: GbmDrmCompositor,
@@ -391,9 +403,14 @@ struct Surface {
     color_managed: bool,
     /// Parsed ICC color profile and LUT for this output.
     color_profile: Option<crate::color::OutputColorProfile>,
+    /// Cached GL 3D LUT texture name for color correction.
+    lut_texture: Option<u32>,
     /// Color information extracted from the EDID. Used by the color management protocol.
-    #[allow(dead_code)]
     edid_color_info: Option<crate::color::EdidColorInfo>,
+    /// Whether HDR output mode is enabled on this connector.
+    hdr_enabled: bool,
+    /// HDR configuration from the config file.
+    hdr_config: Option<niri_config::output::HdrConfig>,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -682,17 +699,33 @@ impl Tty {
                     // Apply pending gamma changes and restore our existing gamma.
                     let device = self.devices.get_mut(&node).unwrap();
                     for (crtc, surface) in device.surfaces.iter_mut() {
-                        if !surface.color_managed {
-                            if let Ok(props) =
-                                ConnectorProperties::try_new(&device.drm, surface.connector)
-                            {
+                        if let Ok(props) =
+                            ConnectorProperties::try_new(&device.drm, surface.connector)
+                        {
+                            if surface.hdr_enabled {
+                                // Re-apply HDR metadata on session resume.
+                                if let Some(ref hdr_config) = surface.hdr_config {
+                                    match set_hdr_output_metadata(
+                                        &props,
+                                        surface.edid_color_info.as_ref(),
+                                        hdr_config,
+                                    ) {
+                                        Ok(()) => (),
+                                        Err(err) => {
+                                            debug!("couldn't restore HDR properties: {err:?}")
+                                        }
+                                    }
+                                }
+                                try_set_nvidia_pq_regamma(&device.drm, *crtc);
+                            } else if !surface.color_managed {
+                                try_reset_nvidia_regamma(&device.drm, *crtc);
                                 match reset_hdr(&props) {
                                     Ok(()) => (),
                                     Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
                                 }
-                            } else {
-                                warn!("failed to get connector properties");
-                            };
+                            }
+                        } else {
+                            warn!("failed to get connector properties");
                         }
 
                         if let Some(ramp) = surface.pending_gamma_change.take() {
@@ -1275,9 +1308,19 @@ impl Tty {
 
         let mut orientation = None;
         if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
-            match reset_hdr(&props) {
-                Ok(()) => (),
-                Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
+            if let Some(ref hdr_config) = config.hdr {
+                // Set HDR output metadata when HDR is configured.
+                match set_hdr_output_metadata(&props, None, hdr_config) {
+                    Ok(()) => debug!("set HDR output metadata for {connector_name}"),
+                    Err(err) => warn!("couldn't set HDR properties for {connector_name}: {err:?}"),
+                }
+                // Try to set NVIDIA PQ regamma for hardware tone mapping.
+                try_set_nvidia_pq_regamma(&device.drm, crtc);
+            } else {
+                match reset_hdr(&props) {
+                    Ok(()) => (),
+                    Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
+                }
             }
 
             match get_panel_orientation(&props) {
@@ -1516,6 +1559,15 @@ impl Tty {
         let edid_color_info = get_edid_info(&device.drm, connector.handle())
             .ok()
             .and_then(|info| crate::color::edid_color_info(&info));
+        output
+            .user_data()
+            .insert_if_missing(|| OutputEdidColorInfo(edid_color_info.clone()));
+        output
+            .user_data()
+            .insert_if_missing(|| OutputHdrEnabled(config.hdr.is_some()));
+        output
+            .user_data()
+            .insert_if_missing(|| OutputHdrConfig(config.hdr));
 
         let vblank_frame_name =
             tracy_client::FrameName::new_leak(format!("vblank on {connector_name}"));
@@ -1535,9 +1587,12 @@ impl Tty {
             dmabuf_feedback,
             gamma_props,
             pending_gamma_change: None,
-            color_managed: color_profile.is_some(),
+            color_managed: color_profile.is_some() || config.hdr.is_some(),
             color_profile,
+            lut_texture: None,
             edid_color_info,
+            hdr_enabled: config.hdr.is_some(),
+            hdr_config: config.hdr,
             vblank_frame: None,
             vblank_frame_name,
             time_since_presentation_plot_name,
@@ -1898,6 +1953,21 @@ impl Tty {
                 return rv;
             }
         };
+
+        // Lazily upload 3D LUT texture if we have a color profile but no texture yet.
+        if surface.color_profile.is_some() && surface.lut_texture.is_none() {
+            if let Some(ref profile) = surface.color_profile {
+                match crate::color::upload_3d_lut_texture(renderer.as_gles_renderer(), &profile.lut_data) {
+                    Ok(tex) => {
+                        surface.lut_texture = Some(tex);
+                        debug!("uploaded 3D LUT texture for {}", surface.name.connector);
+                    }
+                    Err(err) => {
+                        warn!("failed to upload 3D LUT texture: {err:?}");
+                    }
+                }
+            }
+        }
 
         // Render the elements.
         let mut elements =
@@ -3319,6 +3389,115 @@ impl<'a> ConnectorProperties<'a> {
 }
 
 const DRM_MODE_COLORIMETRY_DEFAULT: u64 = 0;
+const DRM_MODE_COLORIMETRY_BT2020_RGB: u64 = 9;
+
+fn set_hdr_output_metadata(
+    props: &ConnectorProperties,
+    edid_color_info: Option<&crate::color::EdidColorInfo>,
+    hdr_config: &niri_config::output::HdrConfig,
+) -> anyhow::Result<()> {
+    // Build the HDR metadata struct.
+    let metadata = crate::color::build_hdr_output_metadata(
+        edid_color_info,
+        hdr_config.max_luminance,
+        hdr_config.min_luminance,
+    );
+
+    // Cast to bytes via bytemuck for the DRM blob.
+    let mut bytes = bytemuck::bytes_of(&metadata).to_vec();
+
+    // Create property blob and set HDR_OUTPUT_METADATA.
+    let blob = drm_ffi::mode::create_property_blob(props.device.as_fd(), &mut bytes)
+        .context("error creating HDR metadata property blob")?;
+
+    let (info, _value) = props.find(c"HDR_OUTPUT_METADATA")?;
+    let property::ValueType::Blob = info.value_type() else {
+        bail!("wrong property type for HDR_OUTPUT_METADATA")
+    };
+    props
+        .device
+        .set_property(props.connector, info.handle(), u64::from(blob.blob_id))
+        .context("error setting HDR_OUTPUT_METADATA property")?;
+
+    // Set Colorspace to BT2020_RGB by looking up the enum value, not hardcoding.
+    if let Err(err) = set_colorspace_bt2020(props) {
+        warn!("couldn't set Colorspace property: {err:?}");
+    }
+
+    Ok(())
+}
+
+/// Set the Colorspace connector property to BT2020_RGB.
+///
+/// Looks up the enum value by name for portability across drivers,
+/// falling back to the standard DRM value (9) if name lookup fails.
+fn set_colorspace_bt2020(props: &ConnectorProperties) -> anyhow::Result<()> {
+    let (info, _value) = props.find(c"Colorspace")?;
+    let property::ValueType::Enum(entries) = info.value_type() else {
+        bail!("wrong property type for Colorspace")
+    };
+
+    // Try to find BT2020_RGB by name first (robust across drivers).
+    let (_raw_values, enums) = entries.values();
+    for entry in enums {
+        if entry.name().to_str() == Ok("BT2020_RGB") {
+            props
+                .device
+                .set_property(props.connector, info.handle(), entry.value())
+                .context("error setting Colorspace property")?;
+            return Ok(());
+        }
+    }
+
+    // Fall back to the well-known kernel constant.
+    props
+        .device
+        .set_property(props.connector, info.handle(), DRM_MODE_COLORIMETRY_BT2020_RGB)
+        .context("error setting Colorspace property")?;
+    Ok(())
+}
+
+/// Try to set NVIDIA's NV_CRTC_REGAMMA_TF property to PQ for hardware tone mapping.
+fn try_set_nvidia_pq_regamma(drm: &DrmDevice, crtc: crtc::Handle) {
+    // NV_CRTC_REGAMMA_TF enum value for PQ varies. Look for the property and PQ enum entry.
+    if let Some((handle, info, _value)) = find_drm_property(drm, crtc, "NV_CRTC_REGAMMA_TF") {
+        if let property::ValueType::Enum(entries) = info.value_type() {
+            let (_raw_values, enums) = entries.values();
+            for entry in enums {
+                if entry.name().to_str() == Ok("PQ") {
+                    match drm.set_property(crtc, handle, entry.value()) {
+                        Ok(()) => {
+                            debug!("set NV_CRTC_REGAMMA_TF to PQ for crtc {crtc:?}");
+                            return;
+                        }
+                        Err(err) => {
+                            warn!("failed to set NV_CRTC_REGAMMA_TF: {err:?}");
+                            return;
+                        }
+                    }
+                }
+            }
+            debug!("NV_CRTC_REGAMMA_TF has no PQ entry");
+        }
+    } else {
+        trace!("NV_CRTC_REGAMMA_TF property not found (not NVIDIA?)");
+    }
+}
+
+/// Reset NV_CRTC_REGAMMA_TF to Default if available.
+fn try_reset_nvidia_regamma(drm: &DrmDevice, crtc: crtc::Handle) {
+    if let Some((handle, info, _value)) = find_drm_property(drm, crtc, "NV_CRTC_REGAMMA_TF") {
+        if let property::ValueType::Enum(entries) = info.value_type() {
+            let (_raw_values, enums) = entries.values();
+            for entry in enums {
+                if entry.name().to_str() == Ok("Default") {
+                    let _ = drm.set_property(crtc, handle, entry.value());
+                    return;
+                }
+            }
+        }
+    }
+}
 
 fn reset_hdr(props: &ConnectorProperties) -> anyhow::Result<()> {
     let (info, value) = props.find(c"HDR_OUTPUT_METADATA")?;

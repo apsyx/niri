@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 
+use anyhow::Context as _;
 use glam::Mat3;
 use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform, UniformName, UniformType,
@@ -18,6 +19,31 @@ pub struct Shaders {
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
+    /// Color correction program (GLES 3.0, compiled manually for sampler3D support).
+    pub color_correction: Option<ColorCorrectionProgram>,
+    /// Tone mapping program (GLES 3.0).
+    pub tone_map: Option<ToneMapProgram>,
+}
+
+/// Raw GL program for color correction using a 3D LUT.
+#[derive(Debug, Clone)]
+pub struct ColorCorrectionProgram {
+    pub program: u32,
+    pub u_tex: i32,
+    pub u_color_lut: i32,
+    pub u_alpha: i32,
+}
+
+/// Raw GL program for tone mapping between transfer functions.
+#[derive(Debug, Clone)]
+pub struct ToneMapProgram {
+    pub program: u32,
+    pub u_tex: i32,
+    pub u_src_tf: i32,
+    pub u_dst_tf: i32,
+    pub u_src_max_lum: i32,
+    pub u_dst_max_lum: i32,
+    pub u_color_matrix: i32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +133,43 @@ impl Shaders {
             })
             .ok();
 
+        let color_correction = compile_gles3_program(
+            renderer,
+            FULLSCREEN_VERT_300ES,
+            include_str!("color_correction.frag"),
+            &["tex", "color_lut", "alpha"],
+        )
+        .map(|p| ColorCorrectionProgram {
+            program: p.0,
+            u_tex: p.1[0],
+            u_color_lut: p.1[1],
+            u_alpha: p.1[2],
+        })
+        .map_err(|err| {
+            warn!("error compiling color correction shader: {err}");
+        })
+        .ok();
+
+        let tone_map = compile_gles3_program(
+            renderer,
+            FULLSCREEN_VERT_300ES,
+            include_str!("tone_map.frag"),
+            &["tex", "src_tf", "dst_tf", "src_max_lum", "dst_max_lum", "color_matrix"],
+        )
+        .map(|p| ToneMapProgram {
+            program: p.0,
+            u_tex: p.1[0],
+            u_src_tf: p.1[1],
+            u_dst_tf: p.1[2],
+            u_src_max_lum: p.1[3],
+            u_dst_max_lum: p.1[4],
+            u_color_matrix: p.1[5],
+        })
+        .map_err(|err| {
+            warn!("error compiling tone map shader: {err}");
+        })
+        .ok();
+
         Self {
             border,
             shadow,
@@ -116,6 +179,8 @@ impl Shaders {
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
             custom_open: RefCell::new(None),
+            color_correction,
+            tone_map,
         }
     }
 
@@ -307,6 +372,91 @@ pub fn set_custom_open_program(renderer: &mut GlesRenderer, src: Option<&str>) {
             warn!("error destroying previous custom open shader: {err:?}");
         }
     }
+}
+
+/// Fullscreen triangle vertex shader for GLES 3.0 post-processing passes.
+const FULLSCREEN_VERT_300ES: &str = r#"#version 300 es
+precision highp float;
+out vec2 v_coords;
+void main() {
+    // Fullscreen triangle: vertices 0,1,2 cover the screen.
+    float x = float((gl_VertexID & 1) << 2) - 1.0;
+    float y = float((gl_VertexID & 2) << 1) - 1.0;
+    v_coords = vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
+    gl_Position = vec4(x, y, 0.0, 1.0);
+}
+"#;
+
+/// Compile a GLES 3.0 shader program from vertex + fragment source using raw GL.
+/// Returns (program, uniform_locations) on success.
+fn compile_gles3_program(
+    renderer: &mut GlesRenderer,
+    vert_src: &str,
+    frag_src: &str,
+    uniform_names: &[&str],
+) -> anyhow::Result<(u32, Vec<i32>)> {
+    use smithay::backend::renderer::gles::ffi;
+    use std::ffi::CString;
+
+    renderer
+        .with_context(|gl| unsafe {
+            let compile_shader = |shader_type: u32, src: &str| -> anyhow::Result<u32> {
+                let shader = gl.CreateShader(shader_type);
+                let c_src = CString::new(src).unwrap();
+                let ptr = c_src.as_ptr();
+                gl.ShaderSource(shader, 1, &ptr, std::ptr::null());
+                gl.CompileShader(shader);
+
+                let mut success = 0i32;
+                gl.GetShaderiv(shader, ffi::COMPILE_STATUS, &mut success);
+                if success == 0 {
+                    let mut len = 0i32;
+                    gl.GetShaderiv(shader, ffi::INFO_LOG_LENGTH, &mut len);
+                    let mut buf = vec![0u8; len as usize];
+                    gl.GetShaderInfoLog(shader, len, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _);
+                    let log = String::from_utf8_lossy(&buf);
+                    gl.DeleteShader(shader);
+                    anyhow::bail!("shader compilation failed: {log}");
+                }
+                Ok(shader)
+            };
+
+            let vs = compile_shader(ffi::VERTEX_SHADER, vert_src)?;
+            let fs = compile_shader(ffi::FRAGMENT_SHADER, frag_src)?;
+
+            let program = gl.CreateProgram();
+            gl.AttachShader(program, vs);
+            gl.AttachShader(program, fs);
+            gl.LinkProgram(program);
+
+            let mut success = 0i32;
+            gl.GetProgramiv(program, ffi::LINK_STATUS, &mut success);
+            if success == 0 {
+                let mut len = 0i32;
+                gl.GetProgramiv(program, ffi::INFO_LOG_LENGTH, &mut len);
+                let mut buf = vec![0u8; len as usize];
+                gl.GetProgramInfoLog(program, len, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _);
+                let log = String::from_utf8_lossy(&buf);
+                gl.DeleteProgram(program);
+                gl.DeleteShader(vs);
+                gl.DeleteShader(fs);
+                anyhow::bail!("shader linking failed: {log}");
+            }
+
+            gl.DeleteShader(vs);
+            gl.DeleteShader(fs);
+
+            let locations: Vec<i32> = uniform_names
+                .iter()
+                .map(|name| {
+                    let c_name = CString::new(*name).unwrap();
+                    gl.GetUniformLocation(program, c_name.as_ptr())
+                })
+                .collect();
+
+            Ok((program, locations))
+        })
+        .context("failed to access GL context")?
 }
 
 pub fn mat3_uniform(name: &str, mat: Mat3) -> Uniform<'_> {

@@ -2310,10 +2310,8 @@ impl Niri {
         let mutter_x11_interop_state =
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
 
-        // FIXME: Color management protocol disabled pending crash investigation.
-        // The protocol dispatch causes heap corruption when clients use it.
         let color_management_state =
-            ColorManagementState::new_disabled(&display_handle);
+            ColorManagementState::new::<State, _>(&display_handle, move |_| true);
 
         #[cfg(test)]
         let single_pixel_buffer_state = SinglePixelBufferState::new::<State>(&display_handle);

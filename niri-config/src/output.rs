@@ -99,6 +99,22 @@ pub struct Output {
     pub hot_corners: Option<HotCorners>,
     #[knuffel(child)]
     pub layout: Option<LayoutPart>,
+    #[knuffel(child)]
+    pub hdr: Option<HdrConfig>,
+}
+
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct HdrConfig {
+    /// Peak luminance of the display in cd/m².
+    #[knuffel(child, unwrap(argument), default = 1000)]
+    pub max_luminance: u32,
+    /// SDR reference white level in cd/m².
+    #[knuffel(child, unwrap(argument), default = 203)]
+    pub reference_luminance: u32,
+    /// Minimum luminance in 0.0001 cd/m² units (e.g. 500 = 0.05 cd/m²).
+    /// If not set, defaults to 500.
+    #[knuffel(child, unwrap(argument), default = 500)]
+    pub min_luminance: u32,
 }
 
 impl Output {
@@ -133,6 +149,7 @@ impl Default for Output {
             icc_profile: None,
             hot_corners: None,
             layout: None,
+            hdr: None,
         }
     }
 }

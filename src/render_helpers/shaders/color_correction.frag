@@ -13,9 +13,13 @@ out vec4 frag_color;
 void main() {
     vec4 color = texture(tex, v_coords);
 
-    // Apply 3D LUT color correction.
-    // The LUT is indexed by the linear RGB values.
-    vec3 corrected = texture(color_lut, color.rgb).rgb;
+    // Unpremultiply alpha before LUT lookup — the LUT expects
+    // straight color values, not premultiplied.
+    vec3 straight = color.a > 0.0 ? color.rgb / color.a : vec3(0.0);
 
+    // Apply 3D LUT color correction.
+    vec3 corrected = texture(color_lut, straight).rgb;
+
+    // Re-premultiply alpha.
     frag_color = vec4(corrected * color.a, color.a) * alpha;
 }

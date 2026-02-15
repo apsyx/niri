@@ -80,7 +80,8 @@ use crate::protocols::foreign_toplevel::{
     self, ForeignToplevelHandler, ForeignToplevelManagerState,
 };
 use crate::protocols::color_management::{
-    ColorManagementHandler, ColorManagementState, ImageDescription, SurfaceColorDescription,
+    ColorManagementHandler, ColorManagementState, ImageDescription, LuminanceRange, Primaries,
+    SurfaceColorDescription, TransferFunction,
 };
 use crate::protocols::gamma_control::{GammaControlHandler, GammaControlManagerState};
 use crate::protocols::mutter_x11_interop::MutterX11InteropHandler;
@@ -755,14 +756,75 @@ impl ColorManagementHandler for State {
         &mut self.niri.color_management_state
     }
 
-    fn get_output_color_description(&self, _output: &Output) -> ImageDescription {
-        // For now, always report sRGB for outputs.
-        // TODO: return EDID/ICC-based description when available.
+    fn get_output_color_description(&self, output: &Output) -> ImageDescription {
+        #[cfg(not(test))]
+        {
+            let hdr_enabled = output
+                .user_data()
+                .get::<crate::backend::tty::OutputHdrEnabled>()
+                .map(|h| h.0)
+                .unwrap_or(false);
+
+            let hdr_config = output
+                .user_data()
+                .get::<crate::backend::tty::OutputHdrConfig>()
+                .and_then(|h| h.0);
+
+            let edid = output
+                .user_data()
+                .get::<crate::backend::tty::OutputEdidColorInfo>()
+                .and_then(|e| e.0.clone());
+
+            // Build primaries from EDID if available.
+            let primaries = edid.map(|color_info| Primaries {
+                r_x: color_info.red.0,
+                r_y: color_info.red.1,
+                g_x: color_info.green.0,
+                g_y: color_info.green.1,
+                b_x: color_info.blue.0,
+                b_y: color_info.blue.1,
+                w_x: color_info.white.0,
+                w_y: color_info.white.1,
+            });
+
+            if hdr_enabled {
+                let luminance = hdr_config.map(|cfg| LuminanceRange {
+                    min: 0.005,
+                    max: cfg.max_luminance as f64,
+                    reference: cfg.reference_luminance as f64,
+                });
+                return ImageDescription::Parametric {
+                    primaries,
+                    tf: Some(TransferFunction::Pq),
+                    luminance,
+                };
+            }
+
+            if primaries.is_some() {
+                return ImageDescription::Parametric {
+                    primaries,
+                    tf: Some(TransferFunction::Srgb),
+                    luminance: None,
+                };
+            }
+        }
+
         ImageDescription::Srgb
     }
 
-    fn surface_color_changed(&mut self, _surface: &WlSurface, _desc: &SurfaceColorDescription) {
-        // TODO: store description on surface and queue redraw.
+    fn surface_color_changed(&mut self, surface: &WlSurface, desc: &SurfaceColorDescription) {
+        // Store the color description in the surface's data map using a RefCell wrapper.
+        with_states(surface, |data| {
+            use std::cell::RefCell;
+            data.data_map
+                .insert_if_missing(|| RefCell::new(SurfaceColorDescription::default()));
+            if let Some(stored) = data.data_map.get::<RefCell<SurfaceColorDescription>>() {
+                *stored.borrow_mut() = desc.clone();
+            }
+        });
+
+        // Queue a redraw on all outputs since we don't track which output this surface is on.
+        self.niri.queue_redraw_all();
     }
 }
 delegate_color_management!(State);

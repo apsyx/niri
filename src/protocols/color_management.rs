@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -69,6 +70,8 @@ pub enum TransferFunction {
     Srgb,
     Linear,
     Gamma(f64),
+    Pq,
+    Hlg,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -79,7 +82,7 @@ pub struct LuminanceRange {
 }
 
 /// Per-surface color description.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SurfaceColorDescription {
     pub description: ImageDescription,
     pub render_intent: RenderIntent,
@@ -148,7 +151,11 @@ pub struct ImageDescriptionInfoData {
 pub struct IccCreatorData;
 
 /// Builder state for parametric image description creation.
-pub struct ParametricCreatorData;
+pub struct ParametricCreatorData {
+    tf: Mutex<Option<TransferFunction>>,
+    primaries: Mutex<Option<Primaries>>,
+    luminance: Mutex<Option<LuminanceRange>>,
+}
 
 // --- Handler trait ---
 
@@ -246,9 +253,13 @@ where
         // Send supported transfer functions.
         resource.supported_tf_named(wp_color_manager_v1::TransferFunction::Srgb);
         resource.supported_tf_named(wp_color_manager_v1::TransferFunction::ExtLinear);
+        resource.supported_tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
+        resource.supported_tf_named(wp_color_manager_v1::TransferFunction::Hlg);
 
         // Send supported primaries.
         resource.supported_primaries_named(wp_color_manager_v1::Primaries::Srgb);
+        resource.supported_primaries_named(wp_color_manager_v1::Primaries::Bt2020);
+        resource.supported_primaries_named(wp_color_manager_v1::Primaries::DisplayP3);
 
         // Signal that all feature advertisements are done.
         resource.done();
@@ -268,6 +279,7 @@ where
     D: Dispatch<WpColorManagementSurfaceV1, ColorManagementSurfaceData>,
     D: Dispatch<WpColorManagementSurfaceFeedbackV1, ColorManagementSurfaceFeedbackData>,
     D: Dispatch<WpImageDescriptionV1, ImageDescriptionData>,
+    D: Dispatch<WpImageDescriptionReferenceV1, ImageDescriptionReferenceData>,
     D: Dispatch<WpImageDescriptionCreatorIccV1, IccCreatorData>,
     D: Dispatch<WpImageDescriptionCreatorParamsV1, ParametricCreatorData>,
     D: ColorManagementHandler,
@@ -324,7 +336,14 @@ where
                 data_init.init(obj, IccCreatorData);
             }
             wp_color_manager_v1::Request::CreateParametricCreator { obj } => {
-                data_init.init(obj, ParametricCreatorData);
+                data_init.init(
+                    obj,
+                    ParametricCreatorData {
+                        tf: Mutex::new(None),
+                        primaries: Mutex::new(None),
+                        luminance: Mutex::new(None),
+                    },
+                );
             }
             wp_color_manager_v1::Request::CreateWindowsScrgb { image_description } => {
                 // Not fully supported yet; create as sRGB.
@@ -333,8 +352,16 @@ where
                     data_init.init(image_description, ImageDescriptionData { id: srgb_id });
                 desc.ready(srgb_id);
             }
+            wp_color_manager_v1::Request::GetImageDescription {
+                image_description,
+                reference,
+            } => {
+                let ref_data: &ImageDescriptionReferenceData = reference.data().unwrap();
+                let id = ref_data.id;
+                let desc = data_init.init(image_description, ImageDescriptionData { id });
+                desc.ready(id);
+            }
             wp_color_manager_v1::Request::Destroy => (),
-            _ => (),
         }
     }
 }
@@ -452,8 +479,15 @@ where
                 let desc = data_init.init(image_description, ImageDescriptionData { id: srgb_id });
                 desc.ready(srgb_id);
             }
+            wp_color_management_surface_feedback_v1::Request::GetPreferredParametric {
+                image_description,
+            } => {
+                // Return sRGB as the preferred parametric description for now.
+                let srgb_id = state.color_management_state().srgb_id;
+                let desc = data_init.init(image_description, ImageDescriptionData { id: srgb_id });
+                desc.ready(srgb_id);
+            }
             wp_color_management_surface_feedback_v1::Request::Destroy => (),
-            _ => (),
         }
     }
 }
@@ -590,25 +624,129 @@ where
         _client: &Client,
         _resource: &WpImageDescriptionCreatorParamsV1,
         request: <WpImageDescriptionCreatorParamsV1 as Resource>::Request,
-        _data: &ParametricCreatorData,
+        data: &ParametricCreatorData,
         _dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
     ) {
         match request {
             wp_image_description_creator_params_v1::Request::Create { image_description } => {
-                // For now, create as sRGB.
-                // A full implementation would collect parametric state via interior mutability.
-                let srgb_id = state.color_management_state().srgb_id;
-                let desc =
-                    data_init.init(image_description, ImageDescriptionData { id: srgb_id });
-                desc.ready(srgb_id);
+                let tf = data.tf.lock().unwrap().clone();
+                let primaries = data.primaries.lock().unwrap().clone();
+                let luminance = data.luminance.lock().unwrap().clone();
+
+                let desc_value = ImageDescription::Parametric {
+                    primaries,
+                    tf,
+                    luminance,
+                };
+                let id = state
+                    .color_management_state()
+                    .register_description(desc_value);
+                let desc = data_init.init(image_description, ImageDescriptionData { id });
+                desc.ready(id);
             }
-            // All setter requests are noted but not yet stored without interior mutability.
-            wp_image_description_creator_params_v1::Request::SetTfNamed { .. } => (),
-            wp_image_description_creator_params_v1::Request::SetTfPower { .. } => (),
-            wp_image_description_creator_params_v1::Request::SetPrimariesNamed { .. } => (),
-            wp_image_description_creator_params_v1::Request::SetPrimaries { .. } => (),
-            wp_image_description_creator_params_v1::Request::SetLuminances { .. } => (),
+            wp_image_description_creator_params_v1::Request::SetTfNamed { tf } => {
+                use smithay::reexports::wayland_server::backend::protocol::WEnum;
+                let transfer = match tf {
+                    WEnum::Value(wp_color_manager_v1::TransferFunction::Srgb) => {
+                        TransferFunction::Srgb
+                    }
+                    WEnum::Value(wp_color_manager_v1::TransferFunction::ExtLinear) => {
+                        TransferFunction::Linear
+                    }
+                    WEnum::Value(wp_color_manager_v1::TransferFunction::St2084Pq) => {
+                        TransferFunction::Pq
+                    }
+                    WEnum::Value(wp_color_manager_v1::TransferFunction::Hlg) => {
+                        TransferFunction::Hlg
+                    }
+                    _ => TransferFunction::Srgb,
+                };
+                *data.tf.lock().unwrap() = Some(transfer);
+            }
+            wp_image_description_creator_params_v1::Request::SetTfPower { eexp } => {
+                let gamma = eexp as f64 / 10000.0;
+                *data.tf.lock().unwrap() = Some(TransferFunction::Gamma(gamma));
+            }
+            wp_image_description_creator_params_v1::Request::SetPrimariesNamed { primaries } => {
+                use smithay::reexports::wayland_server::backend::protocol::WEnum;
+                let p = match primaries {
+                    WEnum::Value(wp_color_manager_v1::Primaries::Srgb) => Primaries {
+                        r_x: 0.64,
+                        r_y: 0.33,
+                        g_x: 0.30,
+                        g_y: 0.60,
+                        b_x: 0.15,
+                        b_y: 0.06,
+                        w_x: 0.3127,
+                        w_y: 0.3290,
+                    },
+                    WEnum::Value(wp_color_manager_v1::Primaries::Bt2020) => Primaries {
+                        r_x: 0.708,
+                        r_y: 0.292,
+                        g_x: 0.170,
+                        g_y: 0.797,
+                        b_x: 0.131,
+                        b_y: 0.046,
+                        w_x: 0.3127,
+                        w_y: 0.3290,
+                    },
+                    WEnum::Value(wp_color_manager_v1::Primaries::DisplayP3) => Primaries {
+                        r_x: 0.680,
+                        r_y: 0.320,
+                        g_x: 0.265,
+                        g_y: 0.690,
+                        b_x: 0.150,
+                        b_y: 0.060,
+                        w_x: 0.3127,
+                        w_y: 0.3290,
+                    },
+                    _ => Primaries {
+                        r_x: 0.64,
+                        r_y: 0.33,
+                        g_x: 0.30,
+                        g_y: 0.60,
+                        b_x: 0.15,
+                        b_y: 0.06,
+                        w_x: 0.3127,
+                        w_y: 0.3290,
+                    },
+                };
+                *data.primaries.lock().unwrap() = Some(p);
+            }
+            wp_image_description_creator_params_v1::Request::SetPrimaries {
+                r_x,
+                r_y,
+                g_x,
+                g_y,
+                b_x,
+                b_y,
+                w_x,
+                w_y,
+            } => {
+                // Protocol sends CIE xy × 1,000,000.
+                *data.primaries.lock().unwrap() = Some(Primaries {
+                    r_x: r_x as f64 / 1000000.0,
+                    r_y: r_y as f64 / 1000000.0,
+                    g_x: g_x as f64 / 1000000.0,
+                    g_y: g_y as f64 / 1000000.0,
+                    b_x: b_x as f64 / 1000000.0,
+                    b_y: b_y as f64 / 1000000.0,
+                    w_x: w_x as f64 / 1000000.0,
+                    w_y: w_y as f64 / 1000000.0,
+                });
+            }
+            wp_image_description_creator_params_v1::Request::SetLuminances {
+                min_lum,
+                max_lum,
+                reference_lum,
+            } => {
+                *data.luminance.lock().unwrap() = Some(LuminanceRange {
+                    min: min_lum as f64 / 10000.0,
+                    max: max_lum as f64,
+                    reference: reference_lum as f64,
+                });
+            }
             _ => (),
         }
     }
@@ -622,7 +760,8 @@ fn send_image_description_info(info: &WpImageDescriptionInfoV1, desc: &ImageDesc
             info.tf_named(wp_color_manager_v1::TransferFunction::Srgb);
             info.primaries_named(wp_color_manager_v1::Primaries::Srgb);
             // sRGB primaries: R(0.64,0.33) G(0.30,0.60) B(0.15,0.06) W(0.3127,0.3290)
-            info.primaries(6400, 3300, 3000, 6000, 1500, 600, 3127, 3290);
+            // Protocol uses CIE xy × 1,000,000.
+            info.primaries(640000, 330000, 300000, 600000, 150000, 60000, 312700, 329000);
             info.luminances(0, 80, 80);
         }
         ImageDescription::Icc { .. } => {
@@ -645,17 +784,24 @@ fn send_image_description_info(info: &WpImageDescriptionInfoV1, desc: &ImageDesc
                 Some(TransferFunction::Gamma(g)) => {
                     info.tf_power((*g * 10000.0) as u32);
                 }
+                Some(TransferFunction::Pq) => {
+                    info.tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
+                }
+                Some(TransferFunction::Hlg) => {
+                    info.tf_named(wp_color_manager_v1::TransferFunction::Hlg);
+                }
             }
             if let Some(p) = primaries {
+                // Protocol uses CIE xy × 1,000,000.
                 info.primaries(
-                    (p.r_x * 10000.0) as i32,
-                    (p.r_y * 10000.0) as i32,
-                    (p.g_x * 10000.0) as i32,
-                    (p.g_y * 10000.0) as i32,
-                    (p.b_x * 10000.0) as i32,
-                    (p.b_y * 10000.0) as i32,
-                    (p.w_x * 10000.0) as i32,
-                    (p.w_y * 10000.0) as i32,
+                    (p.r_x * 1000000.0) as i32,
+                    (p.r_y * 1000000.0) as i32,
+                    (p.g_x * 1000000.0) as i32,
+                    (p.g_y * 1000000.0) as i32,
+                    (p.b_x * 1000000.0) as i32,
+                    (p.b_y * 1000000.0) as i32,
+                    (p.w_x * 1000000.0) as i32,
+                    (p.w_y * 1000000.0) as i32,
                 );
             }
             if let Some(l) = luminance {
