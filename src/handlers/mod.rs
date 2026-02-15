@@ -80,9 +80,10 @@ use crate::protocols::foreign_toplevel::{
     self, ForeignToplevelHandler, ForeignToplevelManagerState,
 };
 use crate::protocols::color_management::{
-    ColorManagementHandler, ColorManagementState, ImageDescription, LuminanceRange, Primaries,
-    SurfaceColorDescription, TransferFunction,
+    ColorManagementHandler, ColorManagementState, ImageDescription, SurfaceColorDescription,
 };
+#[cfg(not(test))]
+use crate::protocols::color_management::{LuminanceRange, Primaries, TransferFunction};
 use crate::protocols::gamma_control::{GammaControlHandler, GammaControlManagerState};
 use crate::protocols::mutter_x11_interop::MutterX11InteropHandler;
 use crate::protocols::output_management::{OutputManagementHandler, OutputManagementManagerState};
@@ -756,21 +757,21 @@ impl ColorManagementHandler for State {
         &mut self.niri.color_management_state
     }
 
-    fn get_output_color_description(&self, output: &Output) -> ImageDescription {
+    fn get_output_color_description(&self, _output: &Output) -> ImageDescription {
         #[cfg(not(test))]
         {
-            let hdr_enabled = output
+            let hdr_enabled = _output
                 .user_data()
                 .get::<crate::backend::tty::OutputHdrEnabled>()
                 .map(|h| h.0)
                 .unwrap_or(false);
 
-            let hdr_config = output
+            let hdr_config = _output
                 .user_data()
                 .get::<crate::backend::tty::OutputHdrConfig>()
                 .and_then(|h| h.0);
 
-            let edid = output
+            let edid = _output
                 .user_data()
                 .get::<crate::backend::tty::OutputEdidColorInfo>()
                 .and_then(|e| e.0.clone());

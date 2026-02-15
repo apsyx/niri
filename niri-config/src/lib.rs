@@ -1178,6 +1178,7 @@ mod tests {
                             },
                         ),
                         layout: None,
+                        hdr: None,
                     },
                     Output {
                         off: false,
@@ -1206,6 +1207,7 @@ mod tests {
                         icc_profile: None,
                         hot_corners: None,
                         layout: None,
+                        hdr: None,
                     },
                     Output {
                         off: false,
@@ -1237,6 +1239,7 @@ mod tests {
                         icc_profile: None,
                         hot_corners: None,
                         layout: None,
+                        hdr: None,
                     },
                 ],
             ),
