@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -229,7 +231,13 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
-        frame.override_default_tex_program(self.program.clone(), self.compute_uniforms());
+        let ref_lum = {
+            let shaders = Shaders::get_from_frame(frame);
+            f32::from_bits(shaders.hdr_ref_lum.load(Ordering::Relaxed))
+        };
+        let mut uniforms = self.compute_uniforms();
+        uniforms.push(Uniform::new("ref_lum", ref_lum));
+        frame.override_default_tex_program(self.program.clone(), uniforms);
         RenderElement::<GlesRenderer>::draw(&self.inner, frame, src, dst, damage, opaque_regions)?;
         frame.clear_tex_program_override();
         Ok(())
@@ -253,9 +261,15 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), TtyRendererError<'render>> {
+        let ref_lum = {
+            let shaders = Shaders::get_from_frame(frame.as_gles_frame());
+            f32::from_bits(shaders.hdr_ref_lum.load(Ordering::Relaxed))
+        };
+        let mut uniforms = self.compute_uniforms();
+        uniforms.push(Uniform::new("ref_lum", ref_lum));
         frame
             .as_gles_frame()
-            .override_default_tex_program(self.program.clone(), self.compute_uniforms());
+            .override_default_tex_program(self.program.clone(), uniforms);
         RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions)?;
         frame.as_gles_frame().clear_tex_program_override();
         Ok(())

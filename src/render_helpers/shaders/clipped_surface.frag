@@ -26,6 +26,18 @@ uniform vec2 geo_size;
 uniform vec4 corner_radius;
 uniform mat3 input_to_geo;
 
+// SDR reference white luminance in cd/m². 0.0 = SDR mode (no linearization).
+uniform float ref_lum;
+
+// sRGB EOTF: sRGB signal -> linear
+vec3 srgb_eotf(vec3 v) {
+    return mix(
+        v / 12.92,
+        pow((v + 0.055) / 1.055, vec3(2.4)),
+        step(0.04045, v)
+    );
+}
+
 float rounding_alpha(vec2 coords, vec2 size) {
     vec2 center;
     float radius;
@@ -59,6 +71,12 @@ void main() {
 #if defined(NO_ALPHA)
     color = vec4(color.rgb, 1.0);
 #endif
+
+    // HDR linearization: decode sRGB to linear light and scale to absolute cd/m².
+    if (ref_lum > 0.0) {
+        vec3 straight = color.a > 0.0 ? color.rgb / color.a : vec3(0.0);
+        color = vec4(srgb_eotf(straight) * ref_lum * color.a, color.a);
+    }
 
     if (coords_geo.x < 0.0 || 1.0 < coords_geo.x || coords_geo.y < 0.0 || 1.0 < coords_geo.y) {
         // Clip outside geometry.

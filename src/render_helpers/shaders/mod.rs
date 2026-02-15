@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::atomic::AtomicU32;
 
 use anyhow::Context as _;
 use glam::Mat3;
@@ -20,6 +21,11 @@ pub struct Shaders {
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
+    /// Custom texture shader that linearizes sRGB surfaces for HDR compositing.
+    pub linearize_surface: Option<GlesTexProgram>,
+    /// HDR reference luminance as f32 bits (0.0 = SDR mode).
+    /// AtomicU32 because UserDataMap requires Send + Sync.
+    pub hdr_ref_lum: AtomicU32,
     /// Color correction program (GLES 3.0, compiled manually for sampler3D support).
     pub color_correction: Option<ColorCorrectionProgram>,
     /// Tone mapping program (GLES 3.0).
@@ -111,6 +117,7 @@ impl Shaders {
                     UniformName::new("geo_size", UniformType::_2f),
                     UniformName::new("corner_radius", UniformType::_4f),
                     UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                    UniformName::new("ref_lum", UniformType::_1f),
                 ],
             )
             .map_err(|err| {
@@ -127,10 +134,23 @@ impl Shaders {
         let gradient_fade = renderer
             .compile_custom_texture_shader(
                 include_str!("gradient_fade.frag"),
-                &[UniformName::new("cutoff", UniformType::_2f)],
+                &[
+                    UniformName::new("cutoff", UniformType::_2f),
+                    UniformName::new("ref_lum", UniformType::_1f),
+                ],
             )
             .map_err(|err| {
                 warn!("error compiling gradient fade shader: {err:?}");
+            })
+            .ok();
+
+        let linearize_surface = renderer
+            .compile_custom_texture_shader(
+                include_str!("linearize_surface.frag"),
+                &[UniformName::new("ref_lum", UniformType::_1f)],
+            )
+            .map_err(|err| {
+                warn!("error compiling linearize surface shader: {err:?}");
             })
             .ok();
 
@@ -180,6 +200,8 @@ impl Shaders {
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
             custom_open: RefCell::new(None),
+            linearize_surface,
+            hdr_ref_lum: AtomicU32::new(0),
             color_correction,
             tone_map,
         }

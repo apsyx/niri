@@ -2010,16 +2010,23 @@ impl Tty {
                 };
                 if need_alloc {
                     use smithay::backend::renderer::Offscreen;
-                    let sdr_size = output_size.to_logical(1).to_buffer(1, Transform::Normal);
-                    let sdr_tex: GlesTexture = gles
-                        .create_buffer(Fourcc::Abgr8888, sdr_size)
-                        .context("error creating SDR offscreen texture")?;
+                    let buf_size = output_size.to_logical(1).to_buffer(1, Transform::Normal);
+                    // FP16 linear-light buffer for HDR compositing.
+                    let fp16_tex: GlesTexture = gles
+                        .create_buffer(Fourcc::Abgr16161616f, buf_size)
+                        .context("error creating FP16 offscreen texture")?;
                     let tm_tex: GlesTexture = gles
-                        .create_buffer(swapchain_format, sdr_size)
+                        .create_buffer(swapchain_format, buf_size)
                         .context("error creating tone map output texture")?;
-                    surface.hdr_textures = Some((sdr_tex, tm_tex, output_size));
+                    surface.hdr_textures = Some((fp16_tex, tm_tex, output_size));
                 }
-                let (sdr_texture, tm_texture, _) = surface.hdr_textures.as_ref().unwrap();
+                let (fp16_texture, tm_texture, _) = surface.hdr_textures.as_ref().unwrap();
+
+                // Get the linearize shader program.
+                let linearize_program = shaders::Shaders::get(gles)
+                    .linearize_surface
+                    .clone()
+                    .context("linearize_surface shader not compiled")?;
 
                 // Render all elements using GlesRenderer to the cached offscreen texture.
                 let gles_elements = niri.render::<GlesRenderer>(
@@ -2029,31 +2036,35 @@ impl Tty {
                     RenderTarget::Output,
                 );
 
-                // Bind the cached SDR texture and render into it.
+                // Render elements to FP16 linear-light buffer with per-surface linearization.
                 {
-                    let mut sdr_tex = sdr_texture.clone();
-                    let mut target = gles.bind(&mut sdr_tex)
-                        .context("error binding SDR offscreen texture")?;
-                    let _sync = crate::render_helpers::render_elements(
+                    let mut fp16_tex = fp16_texture.clone();
+                    let mut target = gles.bind(&mut fp16_tex)
+                        .context("error binding FP16 offscreen texture")?;
+                    let _sync = crate::render_helpers::render_elements_hdr(
                         gles,
                         &mut target,
                         output_size,
                         output_scale,
                         output_transform,
                         gles_elements.iter().rev(),
+                        linearize_program,
+                        src_max_lum,
                     )
-                    .context("error rendering elements to offscreen texture")?;
+                    .context("error rendering elements to FP16 texture")?;
                 }
 
-                // Apply tone mapping: sRGB (TF=0) → PQ (TF=1).
+                // Encode Linear → PQ.
+                // src_max_lum = 1.0 because the FP16 buffer already contains
+                // absolute cd/m² values (Linear TF with max_lum=1.0 is a no-op).
                 shaders::apply_tone_map_to(
                     gles,
-                    sdr_texture,
+                    fp16_texture,
                     tm_texture,
                     output_size,
-                    0,              // src_tf: sRGB
+                    3,              // src_tf: Linear
                     1,              // dst_tf: PQ
-                    src_max_lum,
+                    1.0,            // src_max_lum: values already absolute cd/m²
                     dst_max_lum,
                     Mat3::IDENTITY,
                 )

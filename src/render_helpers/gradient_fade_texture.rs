@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
@@ -97,7 +99,14 @@ impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement {
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
-        let uniforms = vec![Uniform::new("cutoff", self.cutoff)];
+        let ref_lum = {
+            let shaders = Shaders::get_from_frame(frame);
+            f32::from_bits(shaders.hdr_ref_lum.load(Ordering::Relaxed))
+        };
+        let uniforms = vec![
+            Uniform::new("cutoff", self.cutoff),
+            Uniform::new("ref_lum", ref_lum),
+        ];
         frame.override_default_tex_program(self.program.0.clone(), uniforms);
         RenderElement::<GlesRenderer>::draw(&self.inner, frame, src, dst, damage, opaque_regions)?;
         frame.clear_tex_program_override();
@@ -121,7 +130,7 @@ impl<'render> RenderElement<TtyRenderer<'render>> for GradientFadeTextureRenderE
         opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), TtyRendererError<'render>> {
         let gles_frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(&self, gles_frame, src, dst, damage, opaque_regions)?;
+        RenderElement::<GlesRenderer>::draw(self, gles_frame, src, dst, damage, opaque_regions)?;
         Ok(())
     }
 

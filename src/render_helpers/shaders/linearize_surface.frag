@@ -20,10 +20,8 @@ varying vec2 v_coords;
 uniform float tint;
 #endif
 
-// x is left edge, y is right edge of the gradient.
-uniform vec2 cutoff;
-
-// SDR reference white luminance in cd/m². 0.0 = SDR mode (no linearization).
+// SDR reference white luminance in cd/m².
+// When > 0, the shader linearizes sRGB and scales to absolute luminance.
 uniform float ref_lum;
 
 // sRGB EOTF: sRGB signal -> linear
@@ -36,21 +34,16 @@ vec3 srgb_eotf(vec3 v) {
 }
 
 void main() {
-    // Sample the texture.
     vec4 color = texture2D(tex, v_coords);
 #if defined(NO_ALPHA)
     color = vec4(color.rgb, 1.0);
 #endif
 
-    // HDR linearization: decode sRGB to linear light and scale to absolute cd/m².
     if (ref_lum > 0.0) {
+        // Unpremultiply alpha.
         vec3 straight = color.a > 0.0 ? color.rgb / color.a : vec3(0.0);
+        // sRGB -> linear, then scale to absolute cd/m².
         color = vec4(srgb_eotf(straight) * ref_lum * color.a, color.a);
-    }
-
-    if (cutoff.x < cutoff.y) {
-        float fade = clamp((cutoff.y - v_coords.x) / (cutoff.y - cutoff.x), 0.0, 1.0);
-        color = color * fade;
     }
 
     // Apply final alpha and tint.
