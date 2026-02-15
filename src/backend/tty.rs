@@ -11,6 +11,7 @@ use std::time::Duration;
 use std::{io, mem};
 
 use anyhow::{anyhow, bail, ensure, Context};
+use glam::Mat3;
 use bytemuck::cast_slice_mut;
 use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
@@ -29,6 +30,7 @@ use smithay::backend::drm::{
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
@@ -64,8 +66,9 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
-use crate::niri::{Niri, RedrawState, State};
+use crate::niri::{Niri, OutputRenderElements, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
+use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
@@ -1969,15 +1972,114 @@ impl Tty {
             }
         }
 
-        // Render the elements.
-        let mut elements =
-            niri.render::<TtyRenderer>(&mut renderer, output, true, RenderTarget::Output);
+        // When HDR is enabled, we render all elements to an offscreen texture first,
+        // then apply tone mapping (sRGB→PQ) as a post-processing pass, and submit the
+        // single tone-mapped texture to the DRM compositor.
+        let hdr_enabled = surface.hdr_enabled;
+        let hdr_dst_max_lum = surface
+            .hdr_config
+            .as_ref()
+            .map(|c| c.max_luminance as f32)
+            .unwrap_or(400.0);
 
-        // Visualize the damage, if enabled.
-        if niri.debug_draw_damage {
-            let output_state = niri.output_state.get_mut(output).unwrap();
-            draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
+        // Render the elements.
+        let mut elements: Vec<OutputRenderElements<TtyRenderer<'_>>>;
+        let mut hdr_elements_storage: Vec<OutputRenderElements<TtyRenderer<'_>>> = Vec::new();
+
+        if hdr_enabled {
+            // HDR path: render to offscreen GlesTexture, tone map, wrap as single element.
+            let tone_mapped = (|| -> anyhow::Result<_> {
+                let output_mode = output.current_mode().unwrap();
+                let output_transform = output.current_transform();
+                let output_size = output_transform.transform_size(output_mode.size);
+                let output_scale = output.current_scale().fractional_scale().into();
+
+                // Render all elements using GlesRenderer to an offscreen texture.
+                let gles = renderer.as_gles_renderer();
+                let gles_elements = niri.render::<GlesRenderer>(
+                    gles,
+                    output,
+                    true,
+                    RenderTarget::Output,
+                );
+                let (sdr_texture, _sync) = crate::render_helpers::render_to_texture(
+                    gles,
+                    output_size,
+                    output_scale,
+                    output_transform,
+                    Fourcc::Abgr8888,
+                    gles_elements.iter().rev(),
+                )
+                .context("error rendering to offscreen texture for HDR")?;
+
+                // Apply tone mapping: sRGB (TF=0) → PQ (TF=1).
+                let tone_mapped = shaders::apply_tone_map(
+                    gles,
+                    &sdr_texture,
+                    output_size,
+                    0,              // src_tf: sRGB
+                    1,              // dst_tf: PQ
+                    80.0,           // src_max_lum: SDR reference white
+                    hdr_dst_max_lum,
+                    Mat3::IDENTITY,
+                )
+                .context("error applying tone map")?;
+
+                // Wrap tone-mapped texture as a DRM element.
+                let buffer = crate::render_helpers::texture::TextureBuffer::from_texture(
+                    gles,
+                    tone_mapped,
+                    output_scale,
+                    output_transform,
+                    Vec::new(),
+                );
+                let logical_size = buffer.logical_size();
+                let elem =
+                    crate::render_helpers::texture::TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        (0., 0.),
+                        1.0,
+                        None,
+                        Some(logical_size),
+                        Kind::Unspecified,
+                    );
+                Ok(OutputRenderElements::Texture(
+                    PrimaryGpuTextureRenderElement(elem),
+                ))
+            })();
+
+            match tone_mapped {
+                Ok(elem) => {
+                    hdr_elements_storage.push(elem);
+                    // Use the single tone-mapped element.
+                    elements = Vec::new();
+                }
+                Err(err) => {
+                    warn!("HDR tone mapping failed, falling back to normal render: {err:?}");
+                    // Fall back to normal render path.
+                    elements = niri.render::<TtyRenderer>(
+                        &mut renderer,
+                        output,
+                        true,
+                        RenderTarget::Output,
+                    );
+                }
+            }
+        } else {
+            elements =
+                niri.render::<TtyRenderer>(&mut renderer, output, true, RenderTarget::Output);
         }
+
+        let render_elements = if !hdr_elements_storage.is_empty() {
+            &hdr_elements_storage
+        } else {
+            // Visualize the damage, if enabled.
+            if niri.debug_draw_damage {
+                let output_state = niri.output_state.get_mut(output).unwrap();
+                draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
+            }
+            &elements
+        };
 
         // Overlay planes are disabled by default as they cause weird performance issues on my
         // system.
@@ -2008,12 +2110,20 @@ impl Tty {
                 }
             }
 
+            // When HDR tone mapping is active, disable direct scanout since all content
+            // must go through the GPU composition + tone mapping pass.
+            if hdr_enabled {
+                flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT);
+                flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY);
+                flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
+            }
+
             flags
         };
 
         // Hand them over to the DRM.
         let drm_compositor = &mut surface.compositor;
-        match drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags) {
+        match drm_compositor.render_frame::<_, _>(&mut renderer, render_elements, [0.; 4], flags) {
             Ok(res) => {
                 let needs_sync = res.needs_sync()
                     || self

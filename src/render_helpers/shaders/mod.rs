@@ -2,10 +2,13 @@ use std::cell::RefCell;
 
 use anyhow::Context as _;
 use glam::Mat3;
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform, UniformName, UniformType,
-    UniformValue,
+    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName,
+    UniformType, UniformValue,
 };
+use smithay::backend::renderer::Offscreen;
+use smithay::utils::{Physical, Size, Transform};
 
 use super::renderer::NiriRenderer;
 use super::shader_element::ShaderProgram;
@@ -467,4 +470,86 @@ pub fn mat3_uniform(name: &str, mat: Mat3) -> Uniform<'_> {
             transpose: false,
         },
     )
+}
+
+/// Apply tone mapping to an input texture, producing a new output texture.
+///
+/// Converts between transfer functions (e.g. sRGB→PQ) with optional gamut conversion.
+/// Transfer function IDs: 0=sRGB, 1=PQ, 2=HLG, 3=Linear.
+pub fn apply_tone_map(
+    renderer: &mut GlesRenderer,
+    input_texture: &GlesTexture,
+    output_size: Size<i32, Physical>,
+    src_tf: i32,
+    dst_tf: i32,
+    src_max_lum: f32,
+    dst_max_lum: f32,
+    color_matrix: Mat3,
+) -> anyhow::Result<GlesTexture> {
+    use smithay::backend::renderer::gles::ffi;
+
+    let tone_map = Shaders::get(renderer)
+        .tone_map
+        .clone()
+        .context("tone map shader not compiled")?;
+
+    let buffer_size = output_size.to_logical(1).to_buffer(1, Transform::Normal);
+    let output_texture: GlesTexture = renderer
+        .create_buffer(Fourcc::Abgr8888, buffer_size)
+        .context("error creating tone map output texture")?;
+
+    let input_tex_id = input_texture.tex_id();
+    let output_tex_id = output_texture.tex_id();
+    let w = output_size.w;
+    let h = output_size.h;
+    let mat_cols = color_matrix.to_cols_array();
+
+    renderer
+        .with_context(|gl| unsafe {
+            // Save current FBO binding.
+            let mut prev_fbo = 0i32;
+            gl.GetIntegerv(ffi::FRAMEBUFFER_BINDING, &mut prev_fbo);
+
+            // Create temporary FBO and attach output texture.
+            let mut fbo = 0u32;
+            gl.GenFramebuffers(1, &mut fbo);
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
+            gl.FramebufferTexture2D(
+                ffi::FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                output_tex_id,
+                0,
+            );
+
+            // Set up rendering state.
+            gl.Viewport(0, 0, w, h);
+            gl.UseProgram(tone_map.program);
+            gl.Disable(ffi::BLEND);
+
+            // Bind input texture.
+            gl.ActiveTexture(ffi::TEXTURE0);
+            gl.BindTexture(ffi::TEXTURE_2D, input_tex_id);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+
+            // Set uniforms.
+            gl.Uniform1i(tone_map.u_tex, 0);
+            gl.Uniform1i(tone_map.u_src_tf, src_tf);
+            gl.Uniform1i(tone_map.u_dst_tf, dst_tf);
+            gl.Uniform1f(tone_map.u_src_max_lum, src_max_lum);
+            gl.Uniform1f(tone_map.u_dst_max_lum, dst_max_lum);
+            gl.UniformMatrix3fv(tone_map.u_color_matrix, 1, ffi::FALSE, mat_cols.as_ptr());
+
+            // Draw fullscreen triangle.
+            gl.DrawArrays(ffi::TRIANGLES, 0, 3);
+
+            // Cleanup.
+            gl.Enable(ffi::BLEND);
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, prev_fbo as u32);
+            gl.DeleteFramebuffers(1, &fbo);
+        })
+        .context("failed to access GL context for tone mapping")?;
+
+    Ok(output_texture)
 }
