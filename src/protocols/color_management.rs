@@ -193,6 +193,19 @@ impl ColorManagementState {
         }
     }
 
+    /// Create state without registering the Wayland global (for debugging).
+    pub fn new_disabled(display: &DisplayHandle) -> Self {
+        let srgb_id = next_image_desc_id();
+        let mut image_descriptions = HashMap::new();
+        image_descriptions.insert(srgb_id, ImageDescription::Srgb);
+
+        Self {
+            display: display.clone(),
+            image_descriptions,
+            srgb_id,
+        }
+    }
+
     fn register_description(&mut self, desc: ImageDescription) -> u32 {
         let id = next_image_desc_id();
         self.image_descriptions.insert(id, desc);
