@@ -1352,29 +1352,37 @@ impl Tty {
         if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
             if let Some(ref hdr_config) = config.hdr {
                 // Set HDR output metadata when HDR is configured.
-                match set_hdr_output_metadata(&props, None, hdr_config) {
-                    Ok(()) => debug!("set HDR output metadata for {connector_name}"),
-                    Err(err) => warn!("couldn't set HDR properties for {connector_name}: {err:?}"),
-                }
-                // Try hardware CRTC color pipeline first (DEGAMMA_LUT → CTM → GAMMA_LUT).
-                // EDID color info isn't extracted yet; pass None to fall back to BT.2020.
-                // It will be re-programmed with EDID data once available.
-                if let Some(mut pipeline) = CrtcColorPipeline::new(&device.drm, crtc) {
-                    match pipeline.program_hdr(
-                        &device.drm,
-                        None,
-                        hdr_config,
-                    ) {
-                        Ok(()) => {
-                            debug!(
-                                "programmed CRTC color pipeline for {connector_name} (hardware HDR)"
-                            );
-                            hdr_hw_luts = true;
-                            crtc_color_pipeline = Some(pipeline);
-                        }
-                        Err(err) => {
-                            warn!("CRTC color pipeline failed for {connector_name}: {err:?}");
-                            pipeline.clear(&device.drm);
+                // This MUST succeed for the display to know it's receiving PQ content.
+                let hdr_metadata_ok = match set_hdr_output_metadata(&props, None, hdr_config) {
+                    Ok(()) => {
+                        debug!("set HDR output metadata for {connector_name}");
+                        true
+                    }
+                    Err(err) => {
+                        warn!("couldn't set HDR properties for {connector_name}: {err:?}");
+                        false
+                    }
+                };
+                // Only try CRTC color pipeline if the display is in HDR mode.
+                // Without HDR_OUTPUT_METADATA, the display interprets PQ as sRGB → washed out.
+                if hdr_metadata_ok {
+                    if let Some(mut pipeline) = CrtcColorPipeline::new(&device.drm, crtc) {
+                        match pipeline.program_hdr(
+                            &device.drm,
+                            None,
+                            hdr_config,
+                        ) {
+                            Ok(()) => {
+                                debug!(
+                                    "programmed CRTC color pipeline for {connector_name} (hardware HDR)"
+                                );
+                                hdr_hw_luts = true;
+                                crtc_color_pipeline = Some(pipeline);
+                            }
+                            Err(err) => {
+                                warn!("CRTC color pipeline failed for {connector_name}: {err:?}");
+                                pipeline.clear(&device.drm);
+                            }
                         }
                     }
                 }
