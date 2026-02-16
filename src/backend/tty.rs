@@ -727,7 +727,6 @@ impl Tty {
                                     match set_hdr_output_metadata(
                                         &props,
                                         *crtc,
-                                        surface.compositor.pending_mode(),
                                         surface.edid_color_info.as_ref(),
                                         hdr_config,
                                     ) {
@@ -1546,12 +1545,11 @@ impl Tty {
             }
         }
 
-        // Some buggy monitors replug upon powering off, so powering on here would prevent such
-        // monitors from powering off. Therefore, we avoid unconditionally powering on.
-        if !niri.monitors_active {
-            if let Err(err) = compositor.clear() {
-                warn!("error clearing drm surface: {err:?}");
-            }
+        // Always clear to ensure the CRTC has a valid framebuffer and active state.
+        // This is needed for HDR atomic commits on NVIDIA, which require full pipeline
+        // state including the primary plane.
+        if let Err(err) = compositor.clear() {
+            warn!("error clearing drm surface: {err:?}");
         }
 
         let vrr_enabled = compositor.vrr_enabled();
@@ -1585,7 +1583,7 @@ impl Tty {
         if let Some(ref hdr_config) = config.hdr {
             if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
                 let hdr_ok = (|| -> anyhow::Result<()> {
-                    set_hdr_output_metadata(&props, crtc, mode, edid_color_info.as_ref(), hdr_config)?;
+                    set_hdr_output_metadata(&props, crtc, edid_color_info.as_ref(), hdr_config)?;
                     debug!("set HDR output metadata for {connector_name}");
 
                     let mut pipeline = CrtcColorPipeline::new(&device.drm, crtc)
@@ -3049,6 +3047,7 @@ impl CrtcColorPipeline {
                 self.gamma_lut,
                 property::Value::Blob(blob_val(gamma_blob)),
             );
+            add_primary_plane_state(device, self.crtc, &mut req);
             device
                 .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
                 .context("error setting CRTC color pipeline via atomic commit")?;
@@ -3080,6 +3079,7 @@ impl CrtcColorPipeline {
             req.add_property(self.crtc, self.degamma_lut, property::Value::Blob(0));
             req.add_property(self.crtc, self.ctm, property::Value::Blob(0));
             req.add_property(self.crtc, self.gamma_lut, property::Value::Blob(0));
+            add_primary_plane_state(device, self.crtc, &mut req);
             let _ = device.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req);
         } else {
             let _ = device.set_property(self.crtc, self.degamma_lut, 0u64);
@@ -3110,6 +3110,7 @@ impl CrtcColorPipeline {
                 self.gamma_lut,
                 property::Value::Blob(blob_val(self.previous_gamma_blob)),
             );
+            add_primary_plane_state(device, self.crtc, &mut req);
             device
                 .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
                 .context("error restoring CRTC color pipeline via atomic commit")?;
@@ -3308,6 +3309,56 @@ fn get_drm_property(
     props
         .into_iter()
         .find_map(|(handle, value)| (handle == prop).then_some(value))
+}
+
+/// Find the primary plane currently assigned to the given CRTC.
+fn find_primary_plane(drm: &DrmDevice, crtc: crtc::Handle) -> Option<plane::Handle> {
+    let plane_handles = drm.plane_handles().ok()?;
+
+    for plane in plane_handles {
+        let Ok(info) = drm.get_plane(plane) else {
+            continue;
+        };
+
+        // Only consider planes currently assigned to our CRTC.
+        if info.crtc() != Some(crtc) {
+            continue;
+        }
+
+        // Check if this is a primary plane.
+        if let Some((_, type_info, value)) = find_drm_property(drm, plane, "type") {
+            match type_info.value_type().convert_value(value) {
+                property::Value::Enum(Some(val)) => {
+                    if val.value() == PlaneType::Primary as u64 {
+                        return Some(plane);
+                    }
+                }
+                _ => (),
+            }
+        }
+    }
+
+    None
+}
+
+/// Include the primary plane's current state in an atomic request.
+///
+/// NVIDIA requires primary plane state in every atomic commit that touches a CRTC.
+/// This reads back the plane's current property values (set by compositor.clear())
+/// and includes them in the request so the driver sees a complete pipeline.
+fn add_primary_plane_state(drm: &DrmDevice, crtc: crtc::Handle, req: &mut AtomicModeReq) {
+    let Some(primary_plane) = find_primary_plane(drm, crtc) else {
+        return;
+    };
+
+    for prop_name in [
+        "FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W",
+        "CRTC_H",
+    ] {
+        if let Some((handle, _, value)) = find_drm_property(drm, primary_plane, prop_name) {
+            req.add_property(primary_plane, handle, property::Value::Unknown(value));
+        }
+    }
 }
 
 fn refresh_interval(mode: DrmMode) -> Duration {
@@ -3690,7 +3741,6 @@ const DRM_MODE_COLORIMETRY_BT2020_RGB: u64 = 9;
 fn set_hdr_output_metadata(
     props: &ConnectorProperties,
     crtc: crtc::Handle,
-    mode: DrmMode,
     edid_color_info: Option<&crate::color::EdidColorInfo>,
     hdr_config: &niri_config::output::HdrConfig,
 ) -> anyhow::Result<()> {
@@ -3716,8 +3766,8 @@ fn set_hdr_output_metadata(
     // Look up Colorspace BT2020_RGB value.
     let colorspace_value = find_colorspace_bt2020_value(props);
 
-    // Try atomic commit first (required by NVIDIA). Include CRTC ACTIVE + MODE_ID
-    // so the driver sees a complete modeset — NVIDIA rejects partial atomic commits.
+    // Atomic commit with full pipeline state (required by NVIDIA).
+    // The CRTC must already be active with a valid framebuffer (via compositor.clear()).
     if props.device.is_atomic() {
         let mut req = AtomicModeReq::new();
         req.add_property(
@@ -3733,10 +3783,7 @@ fn set_hdr_output_metadata(
             );
         }
 
-        // Include connector→CRTC binding and full CRTC state for a complete modeset.
-        // NVIDIA rejects atomic commits without the full pipeline state.
-        // We set ACTIVE=1 and create a mode blob explicitly rather than reading
-        // back current values (which may be 0 if the CRTC hasn't done its first frame).
+        // Include connector CRTC_ID and CRTC state (read back current values).
         if let Ok((crtc_id_info, _)) = props.find(c"CRTC_ID") {
             req.add_property(
                 props.connector,
@@ -3744,23 +3791,16 @@ fn set_hdr_output_metadata(
                 property::Value::CRTC(Some(crtc)),
             );
         }
-        if let Some((active_h, _, _)) = find_drm_property(props.device, crtc, "ACTIVE") {
-            req.add_property(crtc, active_h, property::Value::Boolean(true));
+        if let Some((active_h, _, active_v)) = find_drm_property(props.device, crtc, "ACTIVE") {
+            req.add_property(crtc, active_h, property::Value::Boolean(active_v != 0));
         }
-        if let Some((mode_h, _, _)) = find_drm_property(props.device, crtc, "MODE_ID") {
-            // Create a mode blob from the actual DRM mode.
-            let mut mode_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &mode as *const DrmMode as *const u8,
-                    std::mem::size_of::<DrmMode>(),
-                )
-                .to_vec()
-            };
-            let mode_blob =
-                drm_ffi::mode::create_property_blob(props.device.as_fd(), &mut mode_bytes)
-                    .context("error creating mode blob for HDR atomic commit")?;
-            req.add_property(crtc, mode_h, property::Value::Blob(u64::from(mode_blob.blob_id)));
+        if let Some((mode_h, _, mode_v)) = find_drm_property(props.device, crtc, "MODE_ID") {
+            req.add_property(crtc, mode_h, property::Value::Blob(mode_v));
         }
+
+        // Include primary plane state — NVIDIA requires plane state in every atomic
+        // commit that includes CRTC state, otherwise NVKMS rejects it.
+        add_primary_plane_state(props.device, crtc, &mut req);
 
         props
             .device
@@ -3852,6 +3892,7 @@ fn reset_hdr(props: &ConnectorProperties, crtc: crtc::Handle) -> anyhow::Result<
         if let Some((mode_h, _, mode_v)) = find_drm_property(props.device, crtc, "MODE_ID") {
             req.add_property(crtc, mode_h, property::Value::Blob(mode_v));
         }
+        add_primary_plane_state(props.device, crtc, &mut req);
         props
             .device
             .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
