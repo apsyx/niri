@@ -3312,30 +3312,44 @@ fn get_drm_property(
         .find_map(|(handle, value)| (handle == prop).then_some(value))
 }
 
-/// Find the primary plane currently assigned to the given CRTC.
+/// Find the primary plane for the given CRTC.
+///
+/// First checks for a plane currently assigned to the CRTC, then falls back to
+/// checking `possible_crtcs` bitmask (needed when the CRTC hasn't been used yet).
 fn find_primary_plane(drm: &DrmDevice, crtc: crtc::Handle) -> Option<plane::Handle> {
     let plane_handles = drm.plane_handles().ok()?;
 
-    for plane in plane_handles {
+    let is_primary = |plane: plane::Handle| -> bool {
+        if let Some((_, type_info, value)) = find_drm_property(drm, plane, "type") {
+            match type_info.value_type().convert_value(value) {
+                property::Value::Enum(Some(val)) => val.value() == PlaneType::Primary as u64,
+                _ => false,
+            }
+        } else {
+            false
+        }
+    };
+
+    // First try: plane currently assigned to our CRTC.
+    for &plane in &plane_handles {
         let Ok(info) = drm.get_plane(plane) else {
             continue;
         };
-
-        // Only consider planes currently assigned to our CRTC.
-        if info.crtc() != Some(crtc) {
-            continue;
+        if info.crtc() == Some(crtc) && is_primary(plane) {
+            return Some(plane);
         }
+    }
 
-        // Check if this is a primary plane.
-        if let Some((_, type_info, value)) = find_drm_property(drm, plane, "type") {
-            match type_info.value_type().convert_value(value) {
-                property::Value::Enum(Some(val)) => {
-                    if val.value() == PlaneType::Primary as u64 {
-                        return Some(plane);
-                    }
-                }
-                _ => (),
-            }
+    // Second try: use possible_crtcs bitmask (CRTC may not be active yet).
+    let res_handles = drm.resource_handles().ok()?;
+
+    for &plane in &plane_handles {
+        let Ok(info) = drm.get_plane(plane) else {
+            continue;
+        };
+        let possible = res_handles.filter_crtcs(info.possible_crtcs());
+        if possible.contains(&crtc) && is_primary(plane) {
+            return Some(plane);
         }
     }
 
@@ -3771,9 +3785,31 @@ fn set_hdr_output_metadata(
     // Look up Colorspace BT2020_RGB value.
     let colorspace_value = find_colorspace_bt2020_value(props);
 
-    // Atomic commit with full pipeline state (required by NVIDIA).
-    // The CRTC must already be active with a valid framebuffer (via compositor.clear()).
-    if props.device.is_atomic() {
+    // Try legacy set_property first, then atomic commit as fallback.
+    // Log both results so we know which path works on this driver.
+    let legacy_hdr = props
+        .device
+        .set_property(
+            props.connector,
+            hdr_info.handle(),
+            u64::from(blob.blob_id),
+        );
+    debug!("legacy set_property HDR_OUTPUT_METADATA: {legacy_hdr:?}");
+
+    let _legacy_cs = if let Some((cs_handle, cs_val)) = &colorspace_value {
+        let r = props.device.set_property(props.connector, *cs_handle, *cs_val);
+        debug!("legacy set_property Colorspace: {r:?}");
+        Some(r)
+    } else {
+        None
+    };
+
+    if legacy_hdr.is_ok() {
+        // Legacy path worked, nothing else to do.
+        debug!("HDR properties set via legacy set_property");
+    } else if props.device.is_atomic() {
+        // Legacy failed, try atomic commit with full pipeline state.
+        debug!("legacy failed, trying atomic commit");
         let mut req = AtomicModeReq::new();
         req.add_property(
             props.connector,
@@ -3787,8 +3823,6 @@ fn set_hdr_output_metadata(
                 property::Value::Unknown(*cs_val),
             );
         }
-
-        // Include connector CRTC_ID and CRTC state (read back current values).
         if let Ok((crtc_id_info, _)) = props.find(c"CRTC_ID") {
             req.add_property(
                 props.connector,
@@ -3804,9 +3838,6 @@ fn set_hdr_output_metadata(
             debug!("HDR atomic: CRTC MODE_ID = {mode_v}");
             req.add_property(crtc, mode_h, property::Value::Blob(mode_v));
         }
-
-        // Include primary plane state — NVIDIA requires plane state in every atomic
-        // commit that includes CRTC state, otherwise NVKMS rejects it.
         add_primary_plane_state(props.device, crtc, &mut req);
 
         props
@@ -3814,23 +3845,8 @@ fn set_hdr_output_metadata(
             .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
             .context("error setting HDR properties via atomic commit")?;
     } else {
-        props
-            .device
-            .set_property(
-                props.connector,
-                hdr_info.handle(),
-                u64::from(blob.blob_id),
-            )
-            .context("error setting HDR_OUTPUT_METADATA property")?;
-        if let Some((cs_handle, cs_val)) = &colorspace_value {
-            if let Err(err) =
-                props
-                    .device
-                    .set_property(props.connector, *cs_handle, *cs_val)
-            {
-                warn!("couldn't set Colorspace property: {err:?}");
-            }
-        }
+        // Legacy failed and not atomic — propagate the error.
+        legacy_hdr.context("error setting HDR_OUTPUT_METADATA property")?;
     }
 
     Ok(())
