@@ -1548,8 +1548,9 @@ impl Tty {
         // Always clear to ensure the CRTC has a valid framebuffer and active state.
         // This is needed for HDR atomic commits on NVIDIA, which require full pipeline
         // state including the primary plane.
-        if let Err(err) = compositor.clear() {
-            warn!("error clearing drm surface: {err:?}");
+        match compositor.clear() {
+            Ok(()) => debug!("compositor.clear() succeeded for {connector_name}"),
+            Err(err) => warn!("error clearing drm surface for {connector_name}: {err:?}"),
         }
 
         let vrr_enabled = compositor.vrr_enabled();
@@ -3348,14 +3349,18 @@ fn find_primary_plane(drm: &DrmDevice, crtc: crtc::Handle) -> Option<plane::Hand
 /// and includes them in the request so the driver sees a complete pipeline.
 fn add_primary_plane_state(drm: &DrmDevice, crtc: crtc::Handle, req: &mut AtomicModeReq) {
     let Some(primary_plane) = find_primary_plane(drm, crtc) else {
+        debug!("no primary plane found for CRTC {:?}", crtc);
         return;
     };
+
+    debug!("including primary plane {:?} in atomic commit", primary_plane);
 
     for prop_name in [
         "FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W",
         "CRTC_H",
     ] {
         if let Some((handle, _, value)) = find_drm_property(drm, primary_plane, prop_name) {
+            debug!("  plane prop {prop_name} = {value}");
             req.add_property(primary_plane, handle, property::Value::Unknown(value));
         }
     }
@@ -3792,9 +3797,11 @@ fn set_hdr_output_metadata(
             );
         }
         if let Some((active_h, _, active_v)) = find_drm_property(props.device, crtc, "ACTIVE") {
+            debug!("HDR atomic: CRTC ACTIVE = {active_v}");
             req.add_property(crtc, active_h, property::Value::Boolean(active_v != 0));
         }
         if let Some((mode_h, _, mode_v)) = find_drm_property(props.device, crtc, "MODE_ID") {
+            debug!("HDR atomic: CRTC MODE_ID = {mode_v}");
             req.add_property(crtc, mode_h, property::Value::Blob(mode_v));
         }
 
