@@ -2066,7 +2066,13 @@ impl Tty {
                     1,              // dst_tf: PQ
                     1.0,            // src_max_lum: values already absolute cd/m²
                     dst_max_lum,
-                    Mat3::IDENTITY,
+                    {
+                        let m = crate::color::gamut_conversion_matrix(
+                            &crate::color::SRGB_PRIMARIES,
+                            &crate::color::BT2020_PRIMARIES,
+                        );
+                        Mat3::from_cols_array_2d(&m).transpose()
+                    },
                 )
                 .context("error applying tone map")?;
 
