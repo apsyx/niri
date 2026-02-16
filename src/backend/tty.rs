@@ -1591,10 +1591,10 @@ impl Tty {
             .ok()
             .and_then(|info| crate::color::edid_color_info(&info));
 
-        // Set up HDR connector properties to be included in the next frame commit.
-        // On NVIDIA, HDR_OUTPUT_METADATA must be part of the page flip atomic commit
-        // (not a standalone commit), so we set them as extra connector properties on
-        // the DrmSurface and they'll be applied on the first frame render.
+        // Set up HDR connector properties to be included in the next modeset commit.
+        // HDR_OUTPUT_METADATA and Colorspace are modeset-level properties that must be
+        // part of an atomic commit with ALLOW_MODESET. We set them as extra properties
+        // on the DrmSurface so smithay applies them during the initial modeset.
         let mut hdr_active = false;
         let mut crtc_color_pipeline: Option<CrtcColorPipeline> = None;
         if let Some(ref hdr_config) = config.hdr {

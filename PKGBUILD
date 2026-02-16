@@ -2,7 +2,7 @@
 
 pkgname=niri-plus
 pkgver=25.11.r0.e88c1fb4
-pkgrel=1
+pkgrel=2
 pkgdesc="A scrollable-tiling Wayland compositor (with color management & HDR support)"
 arch=(x86_64)
 url="https://github.com/apsyx/niri"
@@ -44,7 +44,9 @@ optdepends=(
 )
 provides=(niri wayland-compositor)
 conflicts=(niri)
-source=("git+https://github.com/apsyx/niri.git#branch=color-management-hdr")
+source=(
+  "git+https://github.com/apsyx/niri.git#branch=color-management-hdr"
+)
 sha256sums=('SKIP')
 
 pkgver() {
@@ -54,19 +56,18 @@ pkgver() {
 
 prepare() {
   cd niri
-  cargo fetch --locked --target "$(rustc --print host-tuple)"
+  cargo fetch --target "$(rustc --print host-tuple)"
 }
 
 build() {
   cd niri
   export NIRI_BUILD_COMMIT="$(git rev-parse --short HEAD)"
   CFLAGS+=(' -ffat-lto-objects')
-  export CARGO_PROFILE_RELEASE_DEBUG=2
-  cargo build --frozen --release --features default
+  cargo build --release --features default
 
   # generate shell completions
   for shell in bash fish zsh; do
-    cargo run --frozen --release --bin niri -- \
+    cargo run --release --bin niri -- \
       completions "$shell" > "$shell-completions"
   done
 }
@@ -75,7 +76,7 @@ check() {
   cd niri
   export XDG_RUNTIME_DIR="$(mktemp -d)"
   export RAYON_NUM_THREADS=1
-  cargo test --all --exclude niri-visual-tests --frozen
+  cargo test --all --exclude niri-visual-tests
 }
 
 package() {
