@@ -3739,12 +3739,24 @@ fn set_hdr_output_metadata(
                 crtc_id_info.handle(),
                 property::Value::CRTC(Some(crtc)),
             );
+            debug!("atomic HDR commit: CRTC_ID = {:?}", crtc);
         }
         if let Some((active_h, _, active_v)) = find_drm_property(props.device, crtc, "ACTIVE") {
+            debug!("atomic HDR commit: ACTIVE = {active_v}");
             req.add_property(crtc, active_h, property::Value::Boolean(active_v != 0));
+        } else {
+            warn!("atomic HDR commit: ACTIVE property not found on CRTC");
         }
         if let Some((mode_h, _, mode_v)) = find_drm_property(props.device, crtc, "MODE_ID") {
+            debug!("atomic HDR commit: MODE_ID = {mode_v}");
             req.add_property(crtc, mode_h, property::Value::Blob(mode_v));
+        } else {
+            warn!("atomic HDR commit: MODE_ID property not found on CRTC");
+        }
+        if let Some((cs_handle, cs_val)) = &colorspace_value {
+            debug!("atomic HDR commit: Colorspace = {cs_val}");
+        } else {
+            debug!("atomic HDR commit: no Colorspace property found");
         }
 
         props
