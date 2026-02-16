@@ -739,6 +739,7 @@ impl Tty {
                                 if let Some(ref hdr_config) = surface.hdr_config {
                                     match set_hdr_output_metadata(
                                         &props,
+                                        *crtc,
                                         surface.edid_color_info.as_ref(),
                                         hdr_config,
                                     ) {
@@ -759,7 +760,7 @@ impl Tty {
                                 }
                             } else if !surface.color_managed {
                                 try_reset_nvidia_regamma(&device.drm, *crtc);
-                                match reset_hdr(&props) {
+                                match reset_hdr(&props, *crtc) {
                                     Ok(()) => (),
                                     Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
                                 }
@@ -1353,7 +1354,7 @@ impl Tty {
             if let Some(ref hdr_config) = config.hdr {
                 // Set HDR output metadata when HDR is configured.
                 // This MUST succeed for the display to know it's receiving PQ content.
-                let hdr_metadata_ok = match set_hdr_output_metadata(&props, None, hdr_config) {
+                let hdr_metadata_ok = match set_hdr_output_metadata(&props, crtc, None, hdr_config) {
                     Ok(()) => {
                         debug!("set HDR output metadata for {connector_name}");
                         true
@@ -1391,7 +1392,7 @@ impl Tty {
                     try_set_nvidia_pq_regamma(&device.drm, crtc);
                 }
             } else {
-                match reset_hdr(&props) {
+                match reset_hdr(&props, crtc) {
                     Ok(()) => (),
                     Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
                 }
@@ -3903,6 +3904,7 @@ const DRM_MODE_COLORIMETRY_BT2020_RGB: u64 = 9;
 
 fn set_hdr_output_metadata(
     props: &ConnectorProperties,
+    crtc: crtc::Handle,
     edid_color_info: Option<&crate::color::EdidColorInfo>,
     hdr_config: &niri_config::output::HdrConfig,
 ) -> anyhow::Result<()> {
@@ -3928,7 +3930,8 @@ fn set_hdr_output_metadata(
     // Look up Colorspace BT2020_RGB value.
     let colorspace_value = find_colorspace_bt2020_value(props);
 
-    // Try atomic commit first (required by NVIDIA), fall back to legacy.
+    // Try atomic commit first (required by NVIDIA). Include CRTC ACTIVE + MODE_ID
+    // so the driver sees a complete modeset — NVIDIA rejects partial atomic commits.
     if props.device.is_atomic() {
         let mut req = AtomicModeReq::new();
         req.add_property(
@@ -3943,6 +3946,15 @@ fn set_hdr_output_metadata(
                 property::Value::Unknown(*cs_val),
             );
         }
+
+        // Include current CRTC state for a valid modeset.
+        if let Some((active_h, _, active_v)) = find_drm_property(props.device, crtc, "ACTIVE") {
+            req.add_property(crtc, active_h, property::Value::Boolean(active_v != 0));
+        }
+        if let Some((mode_h, _, mode_v)) = find_drm_property(props.device, crtc, "MODE_ID") {
+            req.add_property(crtc, mode_h, property::Value::Blob(mode_v));
+        }
+
         props
             .device
             .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
@@ -4032,7 +4044,7 @@ fn try_reset_nvidia_regamma(drm: &DrmDevice, crtc: crtc::Handle) {
     }
 }
 
-fn reset_hdr(props: &ConnectorProperties) -> anyhow::Result<()> {
+fn reset_hdr(props: &ConnectorProperties, crtc: crtc::Handle) -> anyhow::Result<()> {
     let (hdr_info, hdr_value) = props.find(c"HDR_OUTPUT_METADATA")?;
     let property::ValueType::Blob = hdr_info.value_type() else {
         bail!("wrong property type")
@@ -4061,6 +4073,12 @@ fn reset_hdr(props: &ConnectorProperties) -> anyhow::Result<()> {
                 cs_info.handle(),
                 property::Value::Unknown(DRM_MODE_COLORIMETRY_DEFAULT),
             );
+        }
+        if let Some((active_h, _, active_v)) = find_drm_property(props.device, crtc, "ACTIVE") {
+            req.add_property(crtc, active_h, property::Value::Boolean(active_v != 0));
+        }
+        if let Some((mode_h, _, mode_v)) = find_drm_property(props.device, crtc, "MODE_ID") {
+            req.add_property(crtc, mode_h, property::Value::Blob(mode_v));
         }
         props
             .device
