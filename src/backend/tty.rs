@@ -414,9 +414,18 @@ struct Surface {
     hdr_enabled: bool,
     /// HDR configuration from the config file.
     hdr_config: Option<niri_config::output::HdrConfig>,
+    /// Hardware CRTC color pipeline (DEGAMMA_LUT → CTM → GAMMA_LUT) for HDR.
+    crtc_color_pipeline: Option<CrtcColorPipeline>,
+    /// True when hardware CRTC LUTs handle HDR conversion (no GPU shader needed).
+    hdr_hw_luts: bool,
     /// Cached offscreen textures for HDR tone mapping to avoid per-frame allocation.
-    /// (sdr_offscreen, tone_map_output, size).
-    hdr_textures: Option<(GlesTexture, GlesTexture, Size<i32, Physical>)>,
+    /// (fp16_offscreen, tone_map_output, tone_map_buffer, size).
+    hdr_textures: Option<(
+        GlesTexture,
+        GlesTexture,
+        crate::render_helpers::texture::TextureBuffer<GlesTexture>,
+        Size<i32, Physical>,
+    )>,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -438,6 +447,23 @@ struct GammaProps {
     gamma_lut: property::Handle,
     gamma_lut_size: property::Handle,
     previous_blob: Option<NonZeroU64>,
+}
+
+/// Hardware CRTC color pipeline for HDR: DEGAMMA_LUT → CTM → GAMMA_LUT.
+///
+/// When available, this eliminates the GPU tone-mapping pass entirely by programming
+/// the display hardware to do sRGB→linear (degamma), BT.709→BT.2020 (CTM), and
+/// linear→PQ (gamma) at scanout time.
+struct CrtcColorPipeline {
+    crtc: crtc::Handle,
+    degamma_lut: property::Handle,
+    degamma_lut_size: property::Handle,
+    ctm: property::Handle,
+    gamma_lut: property::Handle,
+    gamma_lut_size: property::Handle,
+    previous_degamma_blob: Option<NonZeroU64>,
+    previous_ctm_blob: Option<NonZeroU64>,
+    previous_gamma_blob: Option<NonZeroU64>,
 }
 
 struct ConnectorProperties<'a> {
@@ -722,7 +748,15 @@ impl Tty {
                                         }
                                     }
                                 }
-                                try_set_nvidia_pq_regamma(&device.drm, *crtc);
+                                // Restore hardware CRTC color pipeline if active.
+                                if let Some(ref pipeline) = surface.crtc_color_pipeline {
+                                    if let Err(err) = pipeline.restore(&device.drm) {
+                                        warn!("error restoring CRTC color pipeline: {err:?}");
+                                    }
+                                }
+                                if !surface.hdr_hw_luts {
+                                    try_set_nvidia_pq_regamma(&device.drm, *crtc);
+                                }
                             } else if !surface.color_managed {
                                 try_reset_nvidia_regamma(&device.drm, *crtc);
                                 match reset_hdr(&props) {
@@ -1313,6 +1347,8 @@ impl Tty {
         debug!("picking mode: {mode:?}");
 
         let mut orientation = None;
+        let mut hdr_hw_luts = false;
+        let mut crtc_color_pipeline = None;
         if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
             if let Some(ref hdr_config) = config.hdr {
                 // Set HDR output metadata when HDR is configured.
@@ -1320,8 +1356,32 @@ impl Tty {
                     Ok(()) => debug!("set HDR output metadata for {connector_name}"),
                     Err(err) => warn!("couldn't set HDR properties for {connector_name}: {err:?}"),
                 }
-                // Try to set NVIDIA PQ regamma for hardware tone mapping.
-                try_set_nvidia_pq_regamma(&device.drm, crtc);
+                // Try hardware CRTC color pipeline first (DEGAMMA_LUT → CTM → GAMMA_LUT).
+                // EDID color info isn't extracted yet; pass None to fall back to BT.2020.
+                // It will be re-programmed with EDID data once available.
+                if let Some(mut pipeline) = CrtcColorPipeline::new(&device.drm, crtc) {
+                    match pipeline.program_hdr(
+                        &device.drm,
+                        None,
+                        hdr_config,
+                    ) {
+                        Ok(()) => {
+                            debug!(
+                                "programmed CRTC color pipeline for {connector_name} (hardware HDR)"
+                            );
+                            hdr_hw_luts = true;
+                            crtc_color_pipeline = Some(pipeline);
+                        }
+                        Err(err) => {
+                            warn!("CRTC color pipeline failed for {connector_name}: {err:?}");
+                            pipeline.clear(&device.drm);
+                        }
+                    }
+                }
+                if !hdr_hw_luts {
+                    // Fall back to NVIDIA PQ regamma or GPU shader path.
+                    try_set_nvidia_pq_regamma(&device.drm, crtc);
+                }
             } else {
                 match reset_hdr(&props) {
                     Ok(()) => (),
@@ -1599,6 +1659,8 @@ impl Tty {
             edid_color_info,
             hdr_enabled: config.hdr.is_some(),
             hdr_config: config.hdr,
+            crtc_color_pipeline,
+            hdr_hw_luts,
             hdr_textures: None,
             vblank_frame: None,
             vblank_frame_name,
@@ -1610,14 +1672,34 @@ impl Tty {
         let res = device.surfaces.insert(crtc, surface);
         assert!(res.is_none(), "crtc must not have already existed");
 
-        // Apply ICC gamma ramp if profile is loaded.
+        // Re-program CRTC color pipeline with EDID data now that it's available.
         let surface = device.surfaces.get_mut(&crtc).unwrap();
-        if let (Some(gamma_props), Some(color_profile)) =
-            (&mut surface.gamma_props, &surface.color_profile)
-        {
-            if let Some(gamma) = &color_profile.gamma_ramp {
-                if let Err(err) = gamma_props.set_gamma(&device.drm, Some(gamma)) {
-                    warn!("error applying initial ICC gamma ramp for {connector_name}: {err:?}");
+        if surface.hdr_hw_luts {
+            if let (Some(ref mut pipeline), Some(ref hdr_config)) =
+                (&mut surface.crtc_color_pipeline, &surface.hdr_config)
+            {
+                if let Err(err) = pipeline.program_hdr(
+                    &device.drm,
+                    surface.edid_color_info.as_ref(),
+                    hdr_config,
+                ) {
+                    warn!("error re-programming CRTC pipeline with EDID data: {err:?}");
+                    pipeline.clear(&device.drm);
+                    surface.hdr_hw_luts = false;
+                    surface.crtc_color_pipeline = None;
+                }
+            }
+        }
+
+        // Apply ICC gamma ramp if profile is loaded (skip when hardware HDR pipeline owns GAMMA_LUT).
+        if !surface.hdr_hw_luts {
+            if let (Some(gamma_props), Some(color_profile)) =
+                (&mut surface.gamma_props, &surface.color_profile)
+            {
+                if let Some(gamma) = &color_profile.gamma_ramp {
+                    if let Err(err) = gamma_props.set_gamma(&device.drm, Some(gamma)) {
+                        warn!("error applying initial ICC gamma ramp for {connector_name}: {err:?}");
+                    }
                 }
             }
         }
@@ -1980,7 +2062,9 @@ impl Tty {
         // then apply tone mapping (sRGB→PQ) as a post-processing pass, and submit the
         // single tone-mapped texture to the DRM compositor.
         let hdr_enabled = surface.hdr_enabled;
+        let hdr_hw_luts = surface.hdr_hw_luts;
         let hdr_config = surface.hdr_config;
+        let edid_color_info = surface.edid_color_info.clone();
         // Use the swapchain format for tone map output (typically 10-bit for HDR).
         let swapchain_format = surface.compositor.format();
 
@@ -1988,7 +2072,7 @@ impl Tty {
         let mut elements: Vec<OutputRenderElements<TtyRenderer<'_>>>;
         let mut hdr_elements_storage: Vec<OutputRenderElements<TtyRenderer<'_>>> = Vec::new();
 
-        if hdr_enabled {
+        if hdr_enabled && !hdr_hw_luts {
             let hdr_config = hdr_config.unwrap();
             // SDR reference white in cd/m² — this is the luminance that sRGB 1.0 maps to.
             let src_max_lum = hdr_config.reference_luminance as f32;
@@ -2005,7 +2089,7 @@ impl Tty {
 
                 // Reuse cached textures if the size matches, otherwise reallocate.
                 let need_alloc = match &surface.hdr_textures {
-                    Some((_, _, cached_size)) => *cached_size != output_size,
+                    Some((_, _, _, cached_size)) => *cached_size != output_size,
                     None => true,
                 };
                 if need_alloc {
@@ -2018,9 +2102,19 @@ impl Tty {
                     let tm_tex: GlesTexture = gles
                         .create_buffer(swapchain_format, buf_size)
                         .context("error creating tone map output texture")?;
-                    surface.hdr_textures = Some((fp16_tex, tm_tex, output_size));
+                    let tm_buffer =
+                        crate::render_helpers::texture::TextureBuffer::from_texture(
+                            gles,
+                            tm_tex.clone(),
+                            output_scale,
+                            output_transform,
+                            Vec::new(),
+                        );
+                    surface.hdr_textures =
+                        Some((fp16_tex, tm_tex, tm_buffer, output_size));
                 }
-                let (fp16_texture, tm_texture, _) = surface.hdr_textures.as_ref().unwrap();
+                let (fp16_texture, tm_texture, _, _) =
+                    surface.hdr_textures.as_ref().unwrap();
 
                 // Get the linearize shader program.
                 let linearize_program = shaders::Shaders::get(gles)
@@ -2067,27 +2161,40 @@ impl Tty {
                     1.0,            // src_max_lum: values already absolute cd/m²
                     dst_max_lum,
                     {
+                        // Convert from sRGB/BT.709 to the monitor's native gamut
+                        // (from EDID). If EDID is unavailable, fall back to BT.2020.
+                        let dst_primaries = edid_color_info
+                            .as_ref()
+                            .map(|ci| crate::color::Primaries {
+                                r_x: ci.red.0,
+                                r_y: ci.red.1,
+                                g_x: ci.green.0,
+                                g_y: ci.green.1,
+                                b_x: ci.blue.0,
+                                b_y: ci.blue.1,
+                                w_x: ci.white.0,
+                                w_y: ci.white.1,
+                            })
+                            .unwrap_or(crate::color::BT2020_PRIMARIES);
                         let m = crate::color::gamut_conversion_matrix(
                             &crate::color::SRGB_PRIMARIES,
-                            &crate::color::BT2020_PRIMARIES,
+                            &dst_primaries,
                         );
                         Mat3::from_cols_array_2d(&m).transpose()
                     },
                 )
                 .context("error applying tone map")?;
 
-                // Wrap tone-mapped texture as a DRM element.
-                let buffer = crate::render_helpers::texture::TextureBuffer::from_texture(
-                    gles,
-                    tm_texture.clone(),
-                    output_scale,
-                    output_transform,
-                    Vec::new(),
-                );
-                let logical_size = buffer.logical_size();
+                // Reuse the cached TextureBuffer (stable Id for damage tracking)
+                // and increment its commit counter to signal new content.
+                let (_, _, tm_buffer, _) =
+                    surface.hdr_textures.as_mut().unwrap();
+                tm_buffer.increment_commit_counter();
+                let tm_buffer_clone = tm_buffer.clone();
+                let logical_size = tm_buffer_clone.logical_size();
                 let elem =
                     crate::render_helpers::texture::TextureRenderElement::from_texture_buffer(
-                        buffer,
+                        tm_buffer_clone,
                         (0., 0.),
                         1.0,
                         None,
@@ -2161,9 +2268,10 @@ impl Tty {
                 }
             }
 
-            // When HDR tone mapping is active, disable direct scanout since all content
+            // When GPU HDR tone mapping is active, disable direct scanout since all content
             // must go through the GPU composition + tone mapping pass.
-            if hdr_enabled {
+            // With hardware CRTC LUTs, scanout is fine — the hardware does the conversion.
+            if hdr_enabled && !hdr_hw_luts {
                 flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT);
                 flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY);
                 flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
@@ -2705,15 +2813,18 @@ impl Tty {
                     surface.color_managed = surface.color_profile.is_some();
 
                     // Apply gamma ramp fallback if profile loaded, or reset it.
-                    if let Some(gamma_props) = &mut surface.gamma_props {
-                        let gamma = surface
-                            .color_profile
-                            .as_ref()
-                            .and_then(|p| p.gamma_ramp.as_deref());
-                        if let Err(err) = gamma_props.set_gamma(&device.drm, gamma) {
-                            warn!(
-                                "error applying ICC gamma ramp for {connector_name}: {err:?}"
-                            );
+                    // Skip when hardware HDR pipeline owns GAMMA_LUT.
+                    if !surface.hdr_hw_luts {
+                        if let Some(gamma_props) = &mut surface.gamma_props {
+                            let gamma = surface
+                                .color_profile
+                                .as_ref()
+                                .and_then(|p| p.gamma_ramp.as_deref());
+                            if let Err(err) = gamma_props.set_gamma(&device.drm, gamma) {
+                                warn!(
+                                    "error applying ICC gamma ramp for {connector_name}: {err:?}"
+                                );
+                            }
                         }
                     }
                 }
@@ -3005,6 +3116,187 @@ impl GammaProps {
             .context("error setting GAMMA_LUT")?;
 
         Ok(())
+    }
+}
+
+impl CrtcColorPipeline {
+    /// Discover DEGAMMA_LUT, DEGAMMA_LUT_SIZE, CTM, GAMMA_LUT, GAMMA_LUT_SIZE on the CRTC.
+    /// Returns `None` if any property is missing (e.g. NVIDIA).
+    fn new(device: &DrmDevice, crtc: crtc::Handle) -> Option<Self> {
+        let props = device.get_properties(crtc).ok()?;
+
+        let mut degamma_lut = None;
+        let mut degamma_lut_size = None;
+        let mut ctm = None;
+        let mut gamma_lut = None;
+        let mut gamma_lut_size = None;
+
+        for (prop, _) in props {
+            let Ok(info) = device.get_property(prop) else {
+                continue;
+            };
+            let Ok(name) = info.name().to_str() else {
+                continue;
+            };
+
+            match name {
+                "DEGAMMA_LUT" => degamma_lut = Some(prop),
+                "DEGAMMA_LUT_SIZE" => degamma_lut_size = Some(prop),
+                "CTM" => ctm = Some(prop),
+                "GAMMA_LUT" => gamma_lut = Some(prop),
+                "GAMMA_LUT_SIZE" => gamma_lut_size = Some(prop),
+                _ => (),
+            }
+        }
+
+        Some(Self {
+            crtc,
+            degamma_lut: degamma_lut?,
+            degamma_lut_size: degamma_lut_size?,
+            ctm: ctm?,
+            gamma_lut: gamma_lut?,
+            gamma_lut_size: gamma_lut_size?,
+            previous_degamma_blob: None,
+            previous_ctm_blob: None,
+            previous_gamma_blob: None,
+        })
+    }
+
+    fn lut_size(&self, device: &DrmDevice, prop: property::Handle) -> anyhow::Result<u32> {
+        let value =
+            get_drm_property(device, self.crtc, prop).context("missing LUT size property")?;
+        Ok(value as u32)
+    }
+
+    /// Program the CRTC hardware color pipeline for HDR:
+    /// DEGAMMA_LUT (sRGB→linear) → CTM (BT.709→monitor gamut) → GAMMA_LUT (linear→PQ).
+    fn program_hdr(
+        &mut self,
+        device: &DrmDevice,
+        edid_color_info: Option<&crate::color::EdidColorInfo>,
+        hdr_config: &niri_config::output::HdrConfig,
+    ) -> anyhow::Result<()> {
+        use crate::color;
+
+        // --- DEGAMMA LUT: sRGB EOTF ---
+        let degamma_size = self
+            .lut_size(device, self.degamma_lut_size)
+            .context("error getting DEGAMMA_LUT_SIZE")?;
+        let degamma_data = color::generate_srgb_degamma_lut(degamma_size);
+        let degamma_blob = {
+            let mut bytes: Vec<u8> = Vec::with_capacity(degamma_data.len() * 8);
+            for entry in &degamma_data {
+                for &val in entry {
+                    bytes.extend_from_slice(&val.to_ne_bytes());
+                }
+            }
+            let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut bytes)
+                .context("error creating DEGAMMA_LUT blob")?;
+            NonZeroU64::new(u64::from(blob.blob_id))
+        };
+
+        // --- CTM: sRGB/BT.709 → monitor gamut ---
+        let dst_primaries = edid_color_info
+            .map(|ci| crate::color::Primaries {
+                r_x: ci.red.0,
+                r_y: ci.red.1,
+                g_x: ci.green.0,
+                g_y: ci.green.1,
+                b_x: ci.blue.0,
+                b_y: ci.blue.1,
+                w_x: ci.white.0,
+                w_y: ci.white.1,
+            })
+            .unwrap_or(color::BT2020_PRIMARIES);
+        let matrix = color::gamut_conversion_matrix(&color::SRGB_PRIMARIES, &dst_primaries);
+        let ctm_data = color::matrix_to_drm_ctm(&matrix);
+        let ctm_blob = {
+            let mut bytes = bytemuck::bytes_of(&ctm_data).to_vec();
+            let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut bytes)
+                .context("error creating CTM blob")?;
+            NonZeroU64::new(u64::from(blob.blob_id))
+        };
+
+        // --- GAMMA LUT: linear → PQ ---
+        let gamma_size = self
+            .lut_size(device, self.gamma_lut_size)
+            .context("error getting GAMMA_LUT_SIZE")?;
+        let gamma_data =
+            color::generate_pq_gamma_lut(gamma_size, hdr_config.reference_luminance as f32);
+        let gamma_blob = {
+            let mut bytes: Vec<u8> = Vec::with_capacity(gamma_data.len() * 8);
+            for entry in &gamma_data {
+                for &val in entry {
+                    bytes.extend_from_slice(&val.to_ne_bytes());
+                }
+            }
+            let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut bytes)
+                .context("error creating GAMMA_LUT blob")?;
+            NonZeroU64::new(u64::from(blob.blob_id))
+        };
+
+        // Set all three CRTC properties.
+        let set_prop = |prop, blob: Option<NonZeroU64>| -> anyhow::Result<()> {
+            let val = blob.map(NonZeroU64::get).unwrap_or(0);
+            device
+                .set_property(self.crtc, prop, property::Value::Blob(val).into())
+                .context("error setting CRTC color property")?;
+            Ok(())
+        };
+
+        set_prop(self.degamma_lut, degamma_blob)
+            .context("error setting DEGAMMA_LUT")?;
+        set_prop(self.ctm, ctm_blob)
+            .context("error setting CTM")?;
+        set_prop(self.gamma_lut, gamma_blob)
+            .context("error setting GAMMA_LUT")?;
+
+        // Clean up old blobs and store new ones.
+        self.destroy_old_blobs(device);
+        self.previous_degamma_blob = degamma_blob;
+        self.previous_ctm_blob = ctm_blob;
+        self.previous_gamma_blob = gamma_blob;
+
+        Ok(())
+    }
+
+    /// Reset all CRTC color properties to identity (blob 0) and destroy old blobs.
+    fn clear(&mut self, device: &DrmDevice) {
+        let zero = property::Value::Blob(0).into();
+        let _ = device.set_property(self.crtc, self.degamma_lut, zero);
+        let _ = device.set_property(self.crtc, self.ctm, zero);
+        let _ = device.set_property(self.crtc, self.gamma_lut, zero);
+        self.destroy_old_blobs(device);
+    }
+
+    /// Re-apply the current blobs (for session resume).
+    fn restore(&self, device: &DrmDevice) -> anyhow::Result<()> {
+        let set = |prop, blob: Option<NonZeroU64>| -> anyhow::Result<()> {
+            let val = blob.map(NonZeroU64::get).unwrap_or(0);
+            device
+                .set_property(self.crtc, prop, property::Value::Blob(val).into())
+                .context("error restoring CRTC color property")?;
+            Ok(())
+        };
+
+        set(self.degamma_lut, self.previous_degamma_blob)?;
+        set(self.ctm, self.previous_ctm_blob)?;
+        set(self.gamma_lut, self.previous_gamma_blob)?;
+        Ok(())
+    }
+
+    fn destroy_old_blobs(&mut self, device: &DrmDevice) {
+        for blob in [
+            self.previous_degamma_blob.take(),
+            self.previous_ctm_blob.take(),
+            self.previous_gamma_blob.take(),
+        ] {
+            if let Some(blob) = blob {
+                if let Err(err) = device.destroy_property_blob(blob.get()) {
+                    warn!("error destroying CRTC color pipeline blob: {err:?}");
+                }
+            }
+        }
     }
 }
 

@@ -450,6 +450,71 @@ fn mul_3x3_f64_to_f32(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f32; 3]; 3] {
     ]
 }
 
+/// Generate an sRGB EOTF (degamma) lookup table for the CRTC DEGAMMA_LUT property.
+///
+/// Each entry maps a normalized sRGB value to linear light using the sRGB transfer function.
+/// Output format: `[red, green, blue, reserved]` with values in `[0, 65535]`.
+pub fn generate_srgb_degamma_lut(size: u32) -> Vec<[u16; 4]> {
+    (0..size)
+        .map(|i| {
+            let v = i as f64 / (size - 1) as f64;
+            let linear = if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            };
+            let val = (linear * 65535.0).round() as u16;
+            [val, val, val, 0]
+        })
+        .collect()
+}
+
+/// Generate a PQ OETF (gamma) lookup table for the CRTC GAMMA_LUT property.
+///
+/// Maps linear light `[0, 1]` where 1.0 = `reference_luminance` cd/m² to PQ code values.
+/// Output format: `[red, green, blue, reserved]` with values in `[0, 65535]`.
+pub fn generate_pq_gamma_lut(size: u32, reference_luminance: f32) -> Vec<[u16; 4]> {
+    // PQ (SMPTE ST 2084) constants.
+    const M1: f64 = 0.1593017578125;
+    const M2: f64 = 78.84375;
+    const C1: f64 = 0.8359375;
+    const C2: f64 = 18.8515625;
+    const C3: f64 = 18.6875;
+
+    (0..size)
+        .map(|i| {
+            let linear = i as f64 / (size - 1) as f64;
+            // Normalize to absolute luminance: linear 1.0 = reference_luminance cd/m².
+            let y = (linear * reference_luminance as f64 / 10000.0).max(0.0);
+            let ym = y.powf(M1);
+            let e = ((C1 + C2 * ym) / (1.0 + C3 * ym)).powf(M2);
+            let val = (e * 65535.0).round().min(65535.0) as u16;
+            [val, val, val, 0]
+        })
+        .collect()
+}
+
+/// Convert a 3×3 f32 matrix (row-major) to DRM `drm_color_ctm` S31.32 fixed-point format.
+///
+/// Each value is encoded as a u64 with the sign bit in the MSB (bit 63),
+/// 31 integer bits, and 32 fractional bits. Row-major layout matches the
+/// kernel's `drm_color_ctm.matrix[9]`.
+pub fn matrix_to_drm_ctm(matrix: &[[f32; 3]; 3]) -> [u64; 9] {
+    let mut result = [0u64; 9];
+    for row in 0..3 {
+        for col in 0..3 {
+            let val = matrix[row][col] as f64;
+            let abs = val.abs();
+            // S31.32: 32 fractional bits.
+            let fixed = (abs * (1u64 << 32) as f64).round() as u64;
+            // Sign bit in MSB.
+            let sign = if val < 0.0 { 1u64 << 63 } else { 0 };
+            result[row * 3 + col] = sign | fixed;
+        }
+    }
+    result
+}
+
 /// Extract color information from a parsed EDID using libdisplay-info.
 pub fn edid_color_info(info: &libdisplay_info::info::Info) -> Option<EdidColorInfo> {
     let primaries = info.default_color_primaries();
