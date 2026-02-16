@@ -3243,21 +3243,40 @@ impl CrtcColorPipeline {
             NonZeroU64::new(u64::from(blob.blob_id))
         };
 
-        // Set all three CRTC properties.
-        let set_prop = |prop, blob: Option<NonZeroU64>| -> anyhow::Result<()> {
-            let val = blob.map(NonZeroU64::get).unwrap_or(0);
-            device
-                .set_property(self.crtc, prop, property::Value::Blob(val).into())
-                .context("error setting CRTC color property")?;
-            Ok(())
-        };
+        // Set all three CRTC properties atomically.
+        let blob_val = |b: Option<NonZeroU64>| -> u64 { b.map(NonZeroU64::get).unwrap_or(0) };
 
-        set_prop(self.degamma_lut, degamma_blob)
-            .context("error setting DEGAMMA_LUT")?;
-        set_prop(self.ctm, ctm_blob)
-            .context("error setting CTM")?;
-        set_prop(self.gamma_lut, gamma_blob)
-            .context("error setting GAMMA_LUT")?;
+        if device.is_atomic() {
+            let mut req = AtomicModeReq::new();
+            req.add_property(
+                self.crtc,
+                self.degamma_lut,
+                property::Value::Blob(blob_val(degamma_blob)),
+            );
+            req.add_property(
+                self.crtc,
+                self.ctm,
+                property::Value::Blob(blob_val(ctm_blob)),
+            );
+            req.add_property(
+                self.crtc,
+                self.gamma_lut,
+                property::Value::Blob(blob_val(gamma_blob)),
+            );
+            device
+                .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+                .context("error setting CRTC color pipeline via atomic commit")?;
+        } else {
+            device
+                .set_property(self.crtc, self.degamma_lut, blob_val(degamma_blob))
+                .context("error setting DEGAMMA_LUT")?;
+            device
+                .set_property(self.crtc, self.ctm, blob_val(ctm_blob))
+                .context("error setting CTM")?;
+            device
+                .set_property(self.crtc, self.gamma_lut, blob_val(gamma_blob))
+                .context("error setting GAMMA_LUT")?;
+        }
 
         // Clean up old blobs and store new ones.
         self.destroy_old_blobs(device);
@@ -3270,26 +3289,55 @@ impl CrtcColorPipeline {
 
     /// Reset all CRTC color properties to identity (blob 0) and destroy old blobs.
     fn clear(&mut self, device: &DrmDevice) {
-        let zero = property::Value::Blob(0).into();
-        let _ = device.set_property(self.crtc, self.degamma_lut, zero);
-        let _ = device.set_property(self.crtc, self.ctm, zero);
-        let _ = device.set_property(self.crtc, self.gamma_lut, zero);
+        if device.is_atomic() {
+            let mut req = AtomicModeReq::new();
+            req.add_property(self.crtc, self.degamma_lut, property::Value::Blob(0));
+            req.add_property(self.crtc, self.ctm, property::Value::Blob(0));
+            req.add_property(self.crtc, self.gamma_lut, property::Value::Blob(0));
+            let _ = device.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req);
+        } else {
+            let _ = device.set_property(self.crtc, self.degamma_lut, 0u64);
+            let _ = device.set_property(self.crtc, self.ctm, 0u64);
+            let _ = device.set_property(self.crtc, self.gamma_lut, 0u64);
+        }
         self.destroy_old_blobs(device);
     }
 
     /// Re-apply the current blobs (for session resume).
     fn restore(&self, device: &DrmDevice) -> anyhow::Result<()> {
-        let set = |prop, blob: Option<NonZeroU64>| -> anyhow::Result<()> {
-            let val = blob.map(NonZeroU64::get).unwrap_or(0);
-            device
-                .set_property(self.crtc, prop, property::Value::Blob(val).into())
-                .context("error restoring CRTC color property")?;
-            Ok(())
-        };
+        let blob_val = |b: Option<NonZeroU64>| -> u64 { b.map(NonZeroU64::get).unwrap_or(0) };
 
-        set(self.degamma_lut, self.previous_degamma_blob)?;
-        set(self.ctm, self.previous_ctm_blob)?;
-        set(self.gamma_lut, self.previous_gamma_blob)?;
+        if device.is_atomic() {
+            let mut req = AtomicModeReq::new();
+            req.add_property(
+                self.crtc,
+                self.degamma_lut,
+                property::Value::Blob(blob_val(self.previous_degamma_blob)),
+            );
+            req.add_property(
+                self.crtc,
+                self.ctm,
+                property::Value::Blob(blob_val(self.previous_ctm_blob)),
+            );
+            req.add_property(
+                self.crtc,
+                self.gamma_lut,
+                property::Value::Blob(blob_val(self.previous_gamma_blob)),
+            );
+            device
+                .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+                .context("error restoring CRTC color pipeline via atomic commit")?;
+        } else {
+            device
+                .set_property(self.crtc, self.degamma_lut, blob_val(self.previous_degamma_blob))
+                .context("error restoring DEGAMMA_LUT")?;
+            device
+                .set_property(self.crtc, self.ctm, blob_val(self.previous_ctm_blob))
+                .context("error restoring CTM")?;
+            device
+                .set_property(self.crtc, self.gamma_lut, blob_val(self.previous_gamma_blob))
+                .context("error restoring GAMMA_LUT")?;
+        }
         Ok(())
     }
 
@@ -3872,51 +3920,74 @@ fn set_hdr_output_metadata(
     let blob = drm_ffi::mode::create_property_blob(props.device.as_fd(), &mut bytes)
         .context("error creating HDR metadata property blob")?;
 
-    let (info, _value) = props.find(c"HDR_OUTPUT_METADATA")?;
-    let property::ValueType::Blob = info.value_type() else {
+    let (hdr_info, _) = props.find(c"HDR_OUTPUT_METADATA")?;
+    let property::ValueType::Blob = hdr_info.value_type() else {
         bail!("wrong property type for HDR_OUTPUT_METADATA")
     };
-    props
-        .device
-        .set_property(props.connector, info.handle(), u64::from(blob.blob_id))
-        .context("error setting HDR_OUTPUT_METADATA property")?;
 
-    // Set Colorspace to BT2020_RGB by looking up the enum value, not hardcoding.
-    if let Err(err) = set_colorspace_bt2020(props) {
-        warn!("couldn't set Colorspace property: {err:?}");
+    // Look up Colorspace BT2020_RGB value.
+    let colorspace_value = find_colorspace_bt2020_value(props);
+
+    // Try atomic commit first (required by NVIDIA), fall back to legacy.
+    if props.device.is_atomic() {
+        let mut req = AtomicModeReq::new();
+        req.add_property(
+            props.connector,
+            hdr_info.handle(),
+            property::Value::Blob(u64::from(blob.blob_id)),
+        );
+        if let Some((cs_handle, cs_val)) = &colorspace_value {
+            req.add_property(
+                props.connector,
+                *cs_handle,
+                property::Value::Unknown(*cs_val),
+            );
+        }
+        props
+            .device
+            .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+            .context("error setting HDR properties via atomic commit")?;
+    } else {
+        props
+            .device
+            .set_property(
+                props.connector,
+                hdr_info.handle(),
+                u64::from(blob.blob_id),
+            )
+            .context("error setting HDR_OUTPUT_METADATA property")?;
+        if let Some((cs_handle, cs_val)) = &colorspace_value {
+            if let Err(err) =
+                props
+                    .device
+                    .set_property(props.connector, *cs_handle, *cs_val)
+            {
+                warn!("couldn't set Colorspace property: {err:?}");
+            }
+        }
     }
 
     Ok(())
 }
 
-/// Set the Colorspace connector property to BT2020_RGB.
-///
-/// Looks up the enum value by name for portability across drivers,
-/// falling back to the standard DRM value (9) if name lookup fails.
-fn set_colorspace_bt2020(props: &ConnectorProperties) -> anyhow::Result<()> {
-    let (info, _value) = props.find(c"Colorspace")?;
+/// Find the Colorspace property handle and BT2020_RGB enum value.
+fn find_colorspace_bt2020_value(
+    props: &ConnectorProperties,
+) -> Option<(property::Handle, u64)> {
+    let (info, _) = props.find(c"Colorspace").ok()?;
     let property::ValueType::Enum(entries) = info.value_type() else {
-        bail!("wrong property type for Colorspace")
+        return None;
     };
 
-    // Try to find BT2020_RGB by name first (robust across drivers).
     let (_raw_values, enums) = entries.values();
     for entry in enums {
         if entry.name().to_str() == Ok("BT2020_RGB") {
-            props
-                .device
-                .set_property(props.connector, info.handle(), entry.value())
-                .context("error setting Colorspace property")?;
-            return Ok(());
+            return Some((info.handle(), entry.value()));
         }
     }
 
     // Fall back to the well-known kernel constant.
-    props
-        .device
-        .set_property(props.connector, info.handle(), DRM_MODE_COLORIMETRY_BT2020_RGB)
-        .context("error setting Colorspace property")?;
-    Ok(())
+    Some((info.handle(), DRM_MODE_COLORIMETRY_BT2020_RGB))
 }
 
 /// Try to set NVIDIA's NV_CRTC_REGAMMA_TF property to PQ for hardware tone mapping.
@@ -3962,27 +4033,52 @@ fn try_reset_nvidia_regamma(drm: &DrmDevice, crtc: crtc::Handle) {
 }
 
 fn reset_hdr(props: &ConnectorProperties) -> anyhow::Result<()> {
-    let (info, value) = props.find(c"HDR_OUTPUT_METADATA")?;
-    let property::ValueType::Blob = info.value_type() else {
+    let (hdr_info, hdr_value) = props.find(c"HDR_OUTPUT_METADATA")?;
+    let property::ValueType::Blob = hdr_info.value_type() else {
         bail!("wrong property type")
     };
 
-    if *value != 0 {
-        props
-            .device
-            .set_property(props.connector, info.handle(), 0)
-            .context("error setting property")?;
+    let (cs_info, cs_value) = props.find(c"Colorspace")?;
+    let property::ValueType::Enum(_) = cs_info.value_type() else {
+        bail!("wrong property type")
+    };
+
+    let need_hdr_reset = *hdr_value != 0;
+    let need_cs_reset = *cs_value != DRM_MODE_COLORIMETRY_DEFAULT;
+
+    if !need_hdr_reset && !need_cs_reset {
+        return Ok(());
     }
 
-    let (info, value) = props.find(c"Colorspace")?;
-    let property::ValueType::Enum(_) = info.value_type() else {
-        bail!("wrong property type")
-    };
-    if *value != DRM_MODE_COLORIMETRY_DEFAULT {
+    if props.device.is_atomic() {
+        let mut req = AtomicModeReq::new();
+        if need_hdr_reset {
+            req.add_property(props.connector, hdr_info.handle(), property::Value::Blob(0));
+        }
+        if need_cs_reset {
+            req.add_property(
+                props.connector,
+                cs_info.handle(),
+                property::Value::Unknown(DRM_MODE_COLORIMETRY_DEFAULT),
+            );
+        }
         props
             .device
-            .set_property(props.connector, info.handle(), DRM_MODE_COLORIMETRY_DEFAULT)
-            .context("error setting property")?;
+            .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
+            .context("error resetting HDR properties via atomic commit")?;
+    } else {
+        if need_hdr_reset {
+            props
+                .device
+                .set_property(props.connector, hdr_info.handle(), 0)
+                .context("error setting property")?;
+        }
+        if need_cs_reset {
+            props
+                .device
+                .set_property(props.connector, cs_info.handle(), DRM_MODE_COLORIMETRY_DEFAULT)
+                .context("error setting property")?;
+        }
     }
 
     Ok(())
