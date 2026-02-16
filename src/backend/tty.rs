@@ -3947,7 +3947,15 @@ fn set_hdr_output_metadata(
             );
         }
 
-        // Include current CRTC state for a valid modeset.
+        // Include connector→CRTC binding and CRTC state for a complete modeset.
+        // NVIDIA rejects atomic commits that don't include the full pipeline state.
+        if let Ok((crtc_id_info, _)) = props.find(c"CRTC_ID") {
+            req.add_property(
+                props.connector,
+                crtc_id_info.handle(),
+                property::Value::CRTC(Some(crtc)),
+            );
+        }
         if let Some((active_h, _, active_v)) = find_drm_property(props.device, crtc, "ACTIVE") {
             req.add_property(crtc, active_h, property::Value::Boolean(active_v != 0));
         }
@@ -4072,6 +4080,13 @@ fn reset_hdr(props: &ConnectorProperties, crtc: crtc::Handle) -> anyhow::Result<
                 props.connector,
                 cs_info.handle(),
                 property::Value::Unknown(DRM_MODE_COLORIMETRY_DEFAULT),
+            );
+        }
+        if let Ok((crtc_id_info, _)) = props.find(c"CRTC_ID") {
+            req.add_property(
+                props.connector,
+                crtc_id_info.handle(),
+                property::Value::CRTC(Some(crtc)),
             );
         }
         if let Some((active_h, _, active_v)) = find_drm_property(props.device, crtc, "ACTIVE") {
