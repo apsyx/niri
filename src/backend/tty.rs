@@ -1596,7 +1596,7 @@ impl Tty {
         // (not a standalone commit), so we set them as extra connector properties on
         // the DrmSurface and they'll be applied on the first frame render.
         let mut hdr_active = false;
-        let mut crtc_color_pipeline = None;
+        let mut crtc_color_pipeline: Option<CrtcColorPipeline> = None;
         if let Some(ref hdr_config) = config.hdr {
             if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
                 let hdr_ok = (|| -> anyhow::Result<()> {
@@ -1608,16 +1608,11 @@ impl Tty {
                     compositor.surface().set_extra_connector_properties(conn_props);
                     debug!("queued HDR connector properties for {connector_name}");
 
-                    let mut pipeline = CrtcColorPipeline::new(&device.drm, crtc)
-                        .context("CRTC missing DEGAMMA_LUT/CTM/GAMMA_LUT properties")?;
-                    let crtc_props = pipeline
-                        .build_hdr_props(&device.drm, edid_color_info.as_ref(), hdr_config)
-                        .context("failed to build CRTC color pipeline")?;
-                    compositor.surface().set_extra_crtc_properties(crtc_props);
+                    // TODO: CRTC color pipeline disabled for testing — isolate whether
+                    // connector props alone pass NVIDIA's atomic test.
                     debug!(
-                        "queued CRTC color pipeline for {connector_name} (hardware HDR)"
+                        "skipping CRTC color pipeline for {connector_name} (testing connector props only)"
                     );
-                    crtc_color_pipeline = Some(pipeline);
                     Ok(())
                 })();
 
