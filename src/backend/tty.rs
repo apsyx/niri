@@ -722,15 +722,16 @@ impl Tty {
                             ConnectorProperties::try_new(&device.drm, surface.connector)
                         {
                             if surface.hdr_enabled {
-                                // Re-apply HDR metadata on session resume.
+                                // Re-apply HDR connector props on session resume.
                                 if let Some(ref hdr_config) = surface.hdr_config {
-                                    match set_hdr_output_metadata(
+                                    match build_hdr_connector_props(
                                         &props,
-                                        *crtc,
                                         surface.edid_color_info.as_ref(),
                                         hdr_config,
                                     ) {
-                                        Ok(()) => (),
+                                        Ok(hdr_props) => {
+                                            surface.compositor.surface().set_extra_connector_properties(hdr_props);
+                                        }
                                         Err(err) => {
                                             debug!("couldn't restore HDR properties: {err:?}")
                                         }
@@ -738,13 +739,15 @@ impl Tty {
                                 }
                                 // Restore hardware CRTC color pipeline.
                                 if let Some(ref pipeline) = surface.crtc_color_pipeline {
-                                    if let Err(err) = pipeline.restore(&device.drm) {
-                                        warn!("error restoring CRTC color pipeline: {err:?}");
-                                    }
+                                    let crtc_props = pipeline.build_restore_props();
+                                    surface.compositor.surface().set_extra_crtc_properties(crtc_props);
                                 }
                             } else if !surface.color_managed {
-                                match reset_hdr(&props, *crtc) {
-                                    Ok(()) => (),
+                                match build_hdr_reset_props(&props) {
+                                    Ok(reset_props) if !reset_props.is_empty() => {
+                                        surface.compositor.surface().set_extra_connector_properties(reset_props);
+                                    }
+                                    Ok(_) => (),
                                     Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
                                 }
                             }
@@ -1333,9 +1336,21 @@ impl Tty {
         let mut orientation = None;
         if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
             if config.hdr.is_none() {
-                match reset_hdr(&props, crtc) {
-                    Ok(()) => (),
-                    Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
+                // Reset HDR properties from a previous session via legacy set_property.
+                // This runs before the DrmCompositor exists, so we can't use the surface API.
+                if let Ok((hdr_info, hdr_value)) = props.find(c"HDR_OUTPUT_METADATA") {
+                    if *hdr_value != 0 {
+                        let _ = device.drm.set_property(connector.handle(), hdr_info.handle(), 0);
+                    }
+                }
+                if let Ok((cs_info, cs_value)) = props.find(c"Colorspace") {
+                    if *cs_value != DRM_MODE_COLORIMETRY_DEFAULT {
+                        let _ = device.drm.set_property(
+                            connector.handle(),
+                            cs_info.handle(),
+                            DRM_MODE_COLORIMETRY_DEFAULT,
+                        );
+                    }
                 }
             }
 
@@ -1545,12 +1560,12 @@ impl Tty {
             }
         }
 
-        // Always clear to ensure the CRTC has a valid framebuffer and active state.
-        // This is needed for HDR atomic commits on NVIDIA, which require full pipeline
-        // state including the primary plane.
-        match compositor.clear() {
-            Ok(()) => debug!("compositor.clear() succeeded for {connector_name}"),
-            Err(err) => warn!("error clearing drm surface for {connector_name}: {err:?}"),
+        // Some buggy monitors replug upon powering off, so powering on here would prevent such
+        // monitors from powering off. Therefore, we avoid unconditionally powering on.
+        if !niri.monitors_active {
+            if let Err(err) = compositor.clear() {
+                warn!("error clearing drm surface: {err:?}");
+            }
         }
 
         let vrr_enabled = compositor.vrr_enabled();
@@ -1576,24 +1591,31 @@ impl Tty {
             .ok()
             .and_then(|info| crate::color::edid_color_info(&info));
 
-        // Set up HDR now that the CRTC is active (has valid ACTIVE + MODE_ID).
-        // NVIDIA requires full pipeline state in atomic commits, so this must happen
-        // after create_surface / DrmCompositor::new which do the initial modeset.
+        // Set up HDR connector properties to be included in the next frame commit.
+        // On NVIDIA, HDR_OUTPUT_METADATA must be part of the page flip atomic commit
+        // (not a standalone commit), so we set them as extra connector properties on
+        // the DrmSurface and they'll be applied on the first frame render.
         let mut hdr_active = false;
         let mut crtc_color_pipeline = None;
         if let Some(ref hdr_config) = config.hdr {
             if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
                 let hdr_ok = (|| -> anyhow::Result<()> {
-                    set_hdr_output_metadata(&props, crtc, edid_color_info.as_ref(), hdr_config)?;
-                    debug!("set HDR output metadata for {connector_name}");
+                    let conn_props = build_hdr_connector_props(
+                        &props,
+                        edid_color_info.as_ref(),
+                        hdr_config,
+                    )?;
+                    compositor.surface().set_extra_connector_properties(conn_props);
+                    debug!("queued HDR connector properties for {connector_name}");
 
                     let mut pipeline = CrtcColorPipeline::new(&device.drm, crtc)
                         .context("CRTC missing DEGAMMA_LUT/CTM/GAMMA_LUT properties")?;
-                    pipeline
-                        .program_hdr(&device.drm, edid_color_info.as_ref(), hdr_config)
-                        .context("failed to program CRTC color pipeline")?;
+                    let crtc_props = pipeline
+                        .build_hdr_props(&device.drm, edid_color_info.as_ref(), hdr_config)
+                        .context("failed to build CRTC color pipeline")?;
+                    compositor.surface().set_extra_crtc_properties(crtc_props);
                     debug!(
-                        "programmed CRTC color pipeline for {connector_name} (hardware HDR)"
+                        "queued CRTC color pipeline for {connector_name} (hardware HDR)"
                     );
                     crtc_color_pipeline = Some(pipeline);
                     Ok(())
@@ -1604,10 +1626,16 @@ impl Tty {
                     Err(err) => {
                         warn!("HDR not available for {connector_name}, falling back to SDR: {err:?}");
                         if let Some(ref mut pipeline) = crtc_color_pipeline {
-                            pipeline.clear(&device.drm);
+                            let clear_props = pipeline.build_clear_props(&device.drm);
+                            compositor.surface().set_extra_crtc_properties(clear_props);
                             crtc_color_pipeline = None;
                         }
-                        let _ = reset_hdr(&props, crtc);
+                        compositor.surface().clear_extra_connector_properties();
+                        if let Ok(reset_props) = build_hdr_reset_props(&props) {
+                            if !reset_props.is_empty() {
+                                compositor.surface().set_extra_connector_properties(reset_props);
+                            }
+                        }
                     }
                 }
             }
@@ -2961,14 +2989,17 @@ impl CrtcColorPipeline {
         Ok(value as u32)
     }
 
-    /// Program the CRTC hardware color pipeline for HDR:
+    /// Build the CRTC color pipeline properties for HDR:
     /// DEGAMMA_LUT (sRGB→linear) → CTM (BT.709→monitor gamut) → GAMMA_LUT (linear→PQ).
-    fn program_hdr(
+    ///
+    /// Returns (property_handle, blob_value) pairs to be set as extra CRTC
+    /// properties on the DrmSurface. They will be applied on the next page flip.
+    fn build_hdr_props(
         &mut self,
         device: &DrmDevice,
         edid_color_info: Option<&crate::color::EdidColorInfo>,
         hdr_config: &niri_config::output::HdrConfig,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<(property::Handle, u64)>> {
         use crate::color;
 
         // --- DEGAMMA LUT: sRGB EOTF ---
@@ -3028,41 +3059,13 @@ impl CrtcColorPipeline {
             NonZeroU64::new(u64::from(blob.blob_id))
         };
 
-        // Set all three CRTC properties atomically.
         let blob_val = |b: Option<NonZeroU64>| -> u64 { b.map(NonZeroU64::get).unwrap_or(0) };
 
-        if device.is_atomic() {
-            let mut req = AtomicModeReq::new();
-            req.add_property(
-                self.crtc,
-                self.degamma_lut,
-                property::Value::Blob(blob_val(degamma_blob)),
-            );
-            req.add_property(
-                self.crtc,
-                self.ctm,
-                property::Value::Blob(blob_val(ctm_blob)),
-            );
-            req.add_property(
-                self.crtc,
-                self.gamma_lut,
-                property::Value::Blob(blob_val(gamma_blob)),
-            );
-            add_primary_plane_state(device, self.crtc, &mut req);
-            device
-                .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-                .context("error setting CRTC color pipeline via atomic commit")?;
-        } else {
-            device
-                .set_property(self.crtc, self.degamma_lut, blob_val(degamma_blob))
-                .context("error setting DEGAMMA_LUT")?;
-            device
-                .set_property(self.crtc, self.ctm, blob_val(ctm_blob))
-                .context("error setting CTM")?;
-            device
-                .set_property(self.crtc, self.gamma_lut, blob_val(gamma_blob))
-                .context("error setting GAMMA_LUT")?;
-        }
+        let props = vec![
+            (self.degamma_lut, blob_val(degamma_blob)),
+            (self.ctm, blob_val(ctm_blob)),
+            (self.gamma_lut, blob_val(gamma_blob)),
+        ];
 
         // Clean up old blobs and store new ones.
         self.destroy_old_blobs(device);
@@ -3070,63 +3073,30 @@ impl CrtcColorPipeline {
         self.previous_ctm_blob = ctm_blob;
         self.previous_gamma_blob = gamma_blob;
 
-        Ok(())
+        Ok(props)
     }
 
-    /// Reset all CRTC color properties to identity (blob 0) and destroy old blobs.
-    fn clear(&mut self, device: &DrmDevice) {
-        if device.is_atomic() {
-            let mut req = AtomicModeReq::new();
-            req.add_property(self.crtc, self.degamma_lut, property::Value::Blob(0));
-            req.add_property(self.crtc, self.ctm, property::Value::Blob(0));
-            req.add_property(self.crtc, self.gamma_lut, property::Value::Blob(0));
-            add_primary_plane_state(device, self.crtc, &mut req);
-            let _ = device.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req);
-        } else {
-            let _ = device.set_property(self.crtc, self.degamma_lut, 0u64);
-            let _ = device.set_property(self.crtc, self.ctm, 0u64);
-            let _ = device.set_property(self.crtc, self.gamma_lut, 0u64);
-        }
+    /// Build CRTC properties to reset color pipeline (blob 0 for all).
+    fn build_clear_props(&mut self, device: &DrmDevice) -> Vec<(property::Handle, u64)> {
         self.destroy_old_blobs(device);
+        self.previous_degamma_blob = None;
+        self.previous_ctm_blob = None;
+        self.previous_gamma_blob = None;
+        vec![
+            (self.degamma_lut, 0),
+            (self.ctm, 0),
+            (self.gamma_lut, 0),
+        ]
     }
 
-    /// Re-apply the current blobs (for session resume).
-    fn restore(&self, device: &DrmDevice) -> anyhow::Result<()> {
+    /// Build CRTC properties to restore the current blobs (for session resume).
+    fn build_restore_props(&self) -> Vec<(property::Handle, u64)> {
         let blob_val = |b: Option<NonZeroU64>| -> u64 { b.map(NonZeroU64::get).unwrap_or(0) };
-
-        if device.is_atomic() {
-            let mut req = AtomicModeReq::new();
-            req.add_property(
-                self.crtc,
-                self.degamma_lut,
-                property::Value::Blob(blob_val(self.previous_degamma_blob)),
-            );
-            req.add_property(
-                self.crtc,
-                self.ctm,
-                property::Value::Blob(blob_val(self.previous_ctm_blob)),
-            );
-            req.add_property(
-                self.crtc,
-                self.gamma_lut,
-                property::Value::Blob(blob_val(self.previous_gamma_blob)),
-            );
-            add_primary_plane_state(device, self.crtc, &mut req);
-            device
-                .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-                .context("error restoring CRTC color pipeline via atomic commit")?;
-        } else {
-            device
-                .set_property(self.crtc, self.degamma_lut, blob_val(self.previous_degamma_blob))
-                .context("error restoring DEGAMMA_LUT")?;
-            device
-                .set_property(self.crtc, self.ctm, blob_val(self.previous_ctm_blob))
-                .context("error restoring CTM")?;
-            device
-                .set_property(self.crtc, self.gamma_lut, blob_val(self.previous_gamma_blob))
-                .context("error restoring GAMMA_LUT")?;
-        }
-        Ok(())
+        vec![
+            (self.degamma_lut, blob_val(self.previous_degamma_blob)),
+            (self.ctm, blob_val(self.previous_ctm_blob)),
+            (self.gamma_lut, blob_val(self.previous_gamma_blob)),
+        ]
     }
 
     fn destroy_old_blobs(&mut self, device: &DrmDevice) {
@@ -3310,74 +3280,6 @@ fn get_drm_property(
     props
         .into_iter()
         .find_map(|(handle, value)| (handle == prop).then_some(value))
-}
-
-/// Find the primary plane for the given CRTC.
-///
-/// First checks for a plane currently assigned to the CRTC, then falls back to
-/// checking `possible_crtcs` bitmask (needed when the CRTC hasn't been used yet).
-fn find_primary_plane(drm: &DrmDevice, crtc: crtc::Handle) -> Option<plane::Handle> {
-    let plane_handles = drm.plane_handles().ok()?;
-
-    let is_primary = |plane: plane::Handle| -> bool {
-        if let Some((_, type_info, value)) = find_drm_property(drm, plane, "type") {
-            match type_info.value_type().convert_value(value) {
-                property::Value::Enum(Some(val)) => val.value() == PlaneType::Primary as u64,
-                _ => false,
-            }
-        } else {
-            false
-        }
-    };
-
-    // First try: plane currently assigned to our CRTC.
-    for &plane in &plane_handles {
-        let Ok(info) = drm.get_plane(plane) else {
-            continue;
-        };
-        if info.crtc() == Some(crtc) && is_primary(plane) {
-            return Some(plane);
-        }
-    }
-
-    // Second try: use possible_crtcs bitmask (CRTC may not be active yet).
-    let res_handles = drm.resource_handles().ok()?;
-
-    for &plane in &plane_handles {
-        let Ok(info) = drm.get_plane(plane) else {
-            continue;
-        };
-        let possible = res_handles.filter_crtcs(info.possible_crtcs());
-        if possible.contains(&crtc) && is_primary(plane) {
-            return Some(plane);
-        }
-    }
-
-    None
-}
-
-/// Include the primary plane's current state in an atomic request.
-///
-/// NVIDIA requires primary plane state in every atomic commit that touches a CRTC.
-/// This reads back the plane's current property values (set by compositor.clear())
-/// and includes them in the request so the driver sees a complete pipeline.
-fn add_primary_plane_state(drm: &DrmDevice, crtc: crtc::Handle, req: &mut AtomicModeReq) {
-    let Some(primary_plane) = find_primary_plane(drm, crtc) else {
-        debug!("no primary plane found for CRTC {:?}", crtc);
-        return;
-    };
-
-    debug!("including primary plane {:?} in atomic commit", primary_plane);
-
-    for prop_name in [
-        "FB_ID", "CRTC_ID", "SRC_X", "SRC_Y", "SRC_W", "SRC_H", "CRTC_X", "CRTC_Y", "CRTC_W",
-        "CRTC_H",
-    ] {
-        if let Some((handle, _, value)) = find_drm_property(drm, primary_plane, prop_name) {
-            debug!("  plane prop {prop_name} = {value}");
-            req.add_property(primary_plane, handle, property::Value::Unknown(value));
-        }
-    }
 }
 
 fn refresh_interval(mode: DrmMode) -> Duration {
@@ -3757,12 +3659,16 @@ impl<'a> ConnectorProperties<'a> {
 const DRM_MODE_COLORIMETRY_DEFAULT: u64 = 0;
 const DRM_MODE_COLORIMETRY_BT2020_RGB: u64 = 9;
 
-fn set_hdr_output_metadata(
+/// Build HDR connector properties (HDR_OUTPUT_METADATA blob + Colorspace).
+///
+/// Returns a list of (connector, property_handle, raw_value) tuples that should
+/// be set as extra connector properties on the DrmSurface. They will be included
+/// in the next atomic page flip commit, matching what KWin does.
+fn build_hdr_connector_props(
     props: &ConnectorProperties,
-    crtc: crtc::Handle,
     edid_color_info: Option<&crate::color::EdidColorInfo>,
     hdr_config: &niri_config::output::HdrConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(connector::Handle, property::Handle, u64)>> {
     // Build the HDR metadata struct.
     let metadata = crate::color::build_hdr_output_metadata(
         edid_color_info,
@@ -3773,7 +3679,7 @@ fn set_hdr_output_metadata(
     // Cast to bytes via bytemuck for the DRM blob.
     let mut bytes = bytemuck::bytes_of(&metadata).to_vec();
 
-    // Create property blob and set HDR_OUTPUT_METADATA.
+    // Create property blob.
     let blob = drm_ffi::mode::create_property_blob(props.device.as_fd(), &mut bytes)
         .context("error creating HDR metadata property blob")?;
 
@@ -3782,74 +3688,18 @@ fn set_hdr_output_metadata(
         bail!("wrong property type for HDR_OUTPUT_METADATA")
     };
 
+    let mut result = vec![(
+        props.connector,
+        hdr_info.handle(),
+        u64::from(blob.blob_id),
+    )];
+
     // Look up Colorspace BT2020_RGB value.
-    let colorspace_value = find_colorspace_bt2020_value(props);
-
-    // Try legacy set_property first, then atomic commit as fallback.
-    // Log both results so we know which path works on this driver.
-    let legacy_hdr = props
-        .device
-        .set_property(
-            props.connector,
-            hdr_info.handle(),
-            u64::from(blob.blob_id),
-        );
-    debug!("legacy set_property HDR_OUTPUT_METADATA: {legacy_hdr:?}");
-
-    let _legacy_cs = if let Some((cs_handle, cs_val)) = &colorspace_value {
-        let r = props.device.set_property(props.connector, *cs_handle, *cs_val);
-        debug!("legacy set_property Colorspace: {r:?}");
-        Some(r)
-    } else {
-        None
-    };
-
-    if legacy_hdr.is_ok() {
-        // Legacy path worked, nothing else to do.
-        debug!("HDR properties set via legacy set_property");
-    } else if props.device.is_atomic() {
-        // Legacy failed, try atomic commit with full pipeline state.
-        debug!("legacy failed, trying atomic commit");
-        let mut req = AtomicModeReq::new();
-        req.add_property(
-            props.connector,
-            hdr_info.handle(),
-            property::Value::Blob(u64::from(blob.blob_id)),
-        );
-        if let Some((cs_handle, cs_val)) = &colorspace_value {
-            req.add_property(
-                props.connector,
-                *cs_handle,
-                property::Value::Unknown(*cs_val),
-            );
-        }
-        if let Ok((crtc_id_info, _)) = props.find(c"CRTC_ID") {
-            req.add_property(
-                props.connector,
-                crtc_id_info.handle(),
-                property::Value::CRTC(Some(crtc)),
-            );
-        }
-        if let Some((active_h, _, active_v)) = find_drm_property(props.device, crtc, "ACTIVE") {
-            debug!("HDR atomic: CRTC ACTIVE = {active_v}");
-            req.add_property(crtc, active_h, property::Value::Boolean(active_v != 0));
-        }
-        if let Some((mode_h, _, mode_v)) = find_drm_property(props.device, crtc, "MODE_ID") {
-            debug!("HDR atomic: CRTC MODE_ID = {mode_v}");
-            req.add_property(crtc, mode_h, property::Value::Blob(mode_v));
-        }
-        add_primary_plane_state(props.device, crtc, &mut req);
-
-        props
-            .device
-            .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-            .context("error setting HDR properties via atomic commit")?;
-    } else {
-        // Legacy failed and not atomic — propagate the error.
-        legacy_hdr.context("error setting HDR_OUTPUT_METADATA property")?;
+    if let Some((cs_handle, cs_val)) = find_colorspace_bt2020_value(props) {
+        result.push((props.connector, cs_handle, cs_val));
     }
 
-    Ok(())
+    Ok(result)
 }
 
 /// Find the Colorspace property handle and BT2020_RGB enum value.
@@ -3872,7 +3722,11 @@ fn find_colorspace_bt2020_value(
     Some((info.handle(), DRM_MODE_COLORIMETRY_BT2020_RGB))
 }
 
-fn reset_hdr(props: &ConnectorProperties, crtc: crtc::Handle) -> anyhow::Result<()> {
+/// Build connector properties to reset HDR (blob=0, colorspace=default).
+/// Returns properties to set on the DrmSurface, or empty vec if no reset needed.
+fn build_hdr_reset_props(
+    props: &ConnectorProperties,
+) -> anyhow::Result<Vec<(connector::Handle, property::Handle, u64)>> {
     let (hdr_info, hdr_value) = props.find(c"HDR_OUTPUT_METADATA")?;
     let property::ValueType::Blob = hdr_info.value_type() else {
         bail!("wrong property type")
@@ -3883,59 +3737,20 @@ fn reset_hdr(props: &ConnectorProperties, crtc: crtc::Handle) -> anyhow::Result<
         bail!("wrong property type")
     };
 
-    let need_hdr_reset = *hdr_value != 0;
-    let need_cs_reset = *cs_value != DRM_MODE_COLORIMETRY_DEFAULT;
+    let mut result = Vec::new();
 
-    if !need_hdr_reset && !need_cs_reset {
-        return Ok(());
+    if *hdr_value != 0 {
+        result.push((props.connector, hdr_info.handle(), 0u64));
+    }
+    if *cs_value != DRM_MODE_COLORIMETRY_DEFAULT {
+        result.push((
+            props.connector,
+            cs_info.handle(),
+            DRM_MODE_COLORIMETRY_DEFAULT,
+        ));
     }
 
-    if props.device.is_atomic() {
-        let mut req = AtomicModeReq::new();
-        if need_hdr_reset {
-            req.add_property(props.connector, hdr_info.handle(), property::Value::Blob(0));
-        }
-        if need_cs_reset {
-            req.add_property(
-                props.connector,
-                cs_info.handle(),
-                property::Value::Unknown(DRM_MODE_COLORIMETRY_DEFAULT),
-            );
-        }
-        if let Ok((crtc_id_info, _)) = props.find(c"CRTC_ID") {
-            req.add_property(
-                props.connector,
-                crtc_id_info.handle(),
-                property::Value::CRTC(Some(crtc)),
-            );
-        }
-        if let Some((active_h, _, active_v)) = find_drm_property(props.device, crtc, "ACTIVE") {
-            req.add_property(crtc, active_h, property::Value::Boolean(active_v != 0));
-        }
-        if let Some((mode_h, _, mode_v)) = find_drm_property(props.device, crtc, "MODE_ID") {
-            req.add_property(crtc, mode_h, property::Value::Blob(mode_v));
-        }
-        add_primary_plane_state(props.device, crtc, &mut req);
-        props
-            .device
-            .atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)
-            .context("error resetting HDR properties via atomic commit")?;
-    } else {
-        if need_hdr_reset {
-            props
-                .device
-                .set_property(props.connector, hdr_info.handle(), 0)
-                .context("error setting property")?;
-        }
-        if need_cs_reset {
-            props
-                .device
-                .set_property(props.connector, cs_info.handle(), DRM_MODE_COLORIMETRY_DEFAULT)
-                .context("error setting property")?;
-        }
-    }
-
-    Ok(())
+    Ok(result)
 }
 
 fn is_vrr_capable(device: &DrmDevice, connector: connector::Handle) -> Option<bool> {
