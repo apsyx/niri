@@ -727,6 +727,7 @@ impl Tty {
                                     match set_hdr_output_metadata(
                                         &props,
                                         *crtc,
+                                        surface.compositor.pending_mode(),
                                         surface.edid_color_info.as_ref(),
                                         hdr_config,
                                     ) {
@@ -1584,7 +1585,7 @@ impl Tty {
         if let Some(ref hdr_config) = config.hdr {
             if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
                 let hdr_ok = (|| -> anyhow::Result<()> {
-                    set_hdr_output_metadata(&props, crtc, edid_color_info.as_ref(), hdr_config)?;
+                    set_hdr_output_metadata(&props, crtc, mode, edid_color_info.as_ref(), hdr_config)?;
                     debug!("set HDR output metadata for {connector_name}");
 
                     let mut pipeline = CrtcColorPipeline::new(&device.drm, crtc)
@@ -3689,6 +3690,7 @@ const DRM_MODE_COLORIMETRY_BT2020_RGB: u64 = 9;
 fn set_hdr_output_metadata(
     props: &ConnectorProperties,
     crtc: crtc::Handle,
+    mode: DrmMode,
     edid_color_info: Option<&crate::color::EdidColorInfo>,
     hdr_config: &niri_config::output::HdrConfig,
 ) -> anyhow::Result<()> {
@@ -3731,32 +3733,33 @@ fn set_hdr_output_metadata(
             );
         }
 
-        // Include connector→CRTC binding and CRTC state for a complete modeset.
-        // NVIDIA rejects atomic commits that don't include the full pipeline state.
+        // Include connector→CRTC binding and full CRTC state for a complete modeset.
+        // NVIDIA rejects atomic commits without the full pipeline state.
+        // We set ACTIVE=1 and create a mode blob explicitly rather than reading
+        // back current values (which may be 0 if the CRTC hasn't done its first frame).
         if let Ok((crtc_id_info, _)) = props.find(c"CRTC_ID") {
             req.add_property(
                 props.connector,
                 crtc_id_info.handle(),
                 property::Value::CRTC(Some(crtc)),
             );
-            debug!("atomic HDR commit: CRTC_ID = {:?}", crtc);
         }
-        if let Some((active_h, _, active_v)) = find_drm_property(props.device, crtc, "ACTIVE") {
-            debug!("atomic HDR commit: ACTIVE = {active_v}");
-            req.add_property(crtc, active_h, property::Value::Boolean(active_v != 0));
-        } else {
-            warn!("atomic HDR commit: ACTIVE property not found on CRTC");
+        if let Some((active_h, _, _)) = find_drm_property(props.device, crtc, "ACTIVE") {
+            req.add_property(crtc, active_h, property::Value::Boolean(true));
         }
-        if let Some((mode_h, _, mode_v)) = find_drm_property(props.device, crtc, "MODE_ID") {
-            debug!("atomic HDR commit: MODE_ID = {mode_v}");
-            req.add_property(crtc, mode_h, property::Value::Blob(mode_v));
-        } else {
-            warn!("atomic HDR commit: MODE_ID property not found on CRTC");
-        }
-        if let Some((cs_handle, cs_val)) = &colorspace_value {
-            debug!("atomic HDR commit: Colorspace = {cs_val}");
-        } else {
-            debug!("atomic HDR commit: no Colorspace property found");
+        if let Some((mode_h, _, _)) = find_drm_property(props.device, crtc, "MODE_ID") {
+            // Create a mode blob from the actual DRM mode.
+            let mut mode_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &mode as *const DrmMode as *const u8,
+                    std::mem::size_of::<DrmMode>(),
+                )
+                .to_vec()
+            };
+            let mode_blob =
+                drm_ffi::mode::create_property_blob(props.device.as_fd(), &mut mode_bytes)
+                    .context("error creating mode blob for HDR atomic commit")?;
+            req.add_property(crtc, mode_h, property::Value::Blob(u64::from(mode_blob.blob_id)));
         }
 
         props
