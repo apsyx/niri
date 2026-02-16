@@ -11,7 +11,6 @@ use std::time::Duration;
 use std::{io, mem};
 
 use anyhow::{anyhow, bail, ensure, Context};
-use glam::Mat3;
 use bytemuck::cast_slice_mut;
 use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
@@ -30,11 +29,10 @@ use smithay::backend::drm::{
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
 use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
-use smithay::backend::renderer::{Bind, DebugFlags, ImportDma, ImportEgl, RendererSuper};
+use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, RendererSuper};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -53,7 +51,7 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{DeviceFd, Physical, Size, Transform};
+use smithay::utils::{DeviceFd, Transform};
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
@@ -66,9 +64,8 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
-use crate::niri::{Niri, OutputRenderElements, RedrawState, State};
+use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
-use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
@@ -416,16 +413,6 @@ struct Surface {
     hdr_config: Option<niri_config::output::HdrConfig>,
     /// Hardware CRTC color pipeline (DEGAMMA_LUT → CTM → GAMMA_LUT) for HDR.
     crtc_color_pipeline: Option<CrtcColorPipeline>,
-    /// True when hardware CRTC LUTs handle HDR conversion (no GPU shader needed).
-    hdr_hw_luts: bool,
-    /// Cached offscreen textures for HDR tone mapping to avoid per-frame allocation.
-    /// (fp16_offscreen, tone_map_output, tone_map_buffer, size).
-    hdr_textures: Option<(
-        GlesTexture,
-        GlesTexture,
-        crate::render_helpers::texture::TextureBuffer<GlesTexture>,
-        Size<i32, Physical>,
-    )>,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -749,17 +736,13 @@ impl Tty {
                                         }
                                     }
                                 }
-                                // Restore hardware CRTC color pipeline if active.
+                                // Restore hardware CRTC color pipeline.
                                 if let Some(ref pipeline) = surface.crtc_color_pipeline {
                                     if let Err(err) = pipeline.restore(&device.drm) {
                                         warn!("error restoring CRTC color pipeline: {err:?}");
                                     }
                                 }
-                                if !surface.hdr_hw_luts {
-                                    try_set_nvidia_pq_regamma(&device.drm, *crtc);
-                                }
                             } else if !surface.color_managed {
-                                try_reset_nvidia_regamma(&device.drm, *crtc);
                                 match reset_hdr(&props, *crtc) {
                                     Ok(()) => (),
                                     Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
@@ -1348,48 +1331,41 @@ impl Tty {
         debug!("picking mode: {mode:?}");
 
         let mut orientation = None;
-        let mut hdr_hw_luts = false;
+        let mut hdr_active = false;
         let mut crtc_color_pipeline = None;
         if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
             if let Some(ref hdr_config) = config.hdr {
-                // Set HDR output metadata when HDR is configured.
-                // This MUST succeed for the display to know it's receiving PQ content.
-                let hdr_metadata_ok = match set_hdr_output_metadata(&props, crtc, None, hdr_config) {
-                    Ok(()) => {
-                        debug!("set HDR output metadata for {connector_name}");
-                        true
-                    }
+                // HDR requires the full hardware pipeline:
+                // 1. HDR_OUTPUT_METADATA + Colorspace on the connector (so the display enters HDR mode)
+                // 2. CRTC DEGAMMA_LUT → CTM → GAMMA_LUT (sRGB→linear, gamut conversion, linear→PQ)
+                // If either fails, fall back to SDR — a GPU shader fallback is too expensive.
+                let hdr_ok = (|| -> anyhow::Result<()> {
+                    set_hdr_output_metadata(&props, crtc, None, hdr_config)?;
+                    debug!("set HDR output metadata for {connector_name}");
+
+                    let mut pipeline = CrtcColorPipeline::new(&device.drm, crtc)
+                        .context("CRTC missing DEGAMMA_LUT/CTM/GAMMA_LUT properties")?;
+                    pipeline
+                        .program_hdr(&device.drm, None, hdr_config)
+                        .context("failed to program CRTC color pipeline")?;
+                    debug!(
+                        "programmed CRTC color pipeline for {connector_name} (hardware HDR)"
+                    );
+                    crtc_color_pipeline = Some(pipeline);
+                    Ok(())
+                })();
+
+                match hdr_ok {
+                    Ok(()) => hdr_active = true,
                     Err(err) => {
-                        warn!("couldn't set HDR properties for {connector_name}: {err:?}");
-                        false
-                    }
-                };
-                // Only try CRTC color pipeline if the display is in HDR mode.
-                // Without HDR_OUTPUT_METADATA, the display interprets PQ as sRGB → washed out.
-                if hdr_metadata_ok {
-                    if let Some(mut pipeline) = CrtcColorPipeline::new(&device.drm, crtc) {
-                        match pipeline.program_hdr(
-                            &device.drm,
-                            None,
-                            hdr_config,
-                        ) {
-                            Ok(()) => {
-                                debug!(
-                                    "programmed CRTC color pipeline for {connector_name} (hardware HDR)"
-                                );
-                                hdr_hw_luts = true;
-                                crtc_color_pipeline = Some(pipeline);
-                            }
-                            Err(err) => {
-                                warn!("CRTC color pipeline failed for {connector_name}: {err:?}");
-                                pipeline.clear(&device.drm);
-                            }
+                        warn!("HDR not available for {connector_name}, falling back to SDR: {err:?}");
+                        // Clean up any partial state.
+                        if let Some(ref mut pipeline) = crtc_color_pipeline {
+                            pipeline.clear(&device.drm);
+                            crtc_color_pipeline = None;
                         }
+                        let _ = reset_hdr(&props, crtc);
                     }
-                }
-                if !hdr_hw_luts {
-                    // Fall back to NVIDIA PQ regamma or GPU shader path.
-                    try_set_nvidia_pq_regamma(&device.drm, crtc);
                 }
             } else {
                 match reset_hdr(&props, crtc) {
@@ -1666,11 +1642,9 @@ impl Tty {
             color_profile,
             lut_texture: None,
             edid_color_info,
-            hdr_enabled: config.hdr.is_some(),
+            hdr_enabled: hdr_active,
             hdr_config: config.hdr,
             crtc_color_pipeline,
-            hdr_hw_luts,
-            hdr_textures: None,
             vblank_frame: None,
             vblank_frame_name,
             time_since_presentation_plot_name,
@@ -1683,7 +1657,7 @@ impl Tty {
 
         // Re-program CRTC color pipeline with EDID data now that it's available.
         let surface = device.surfaces.get_mut(&crtc).unwrap();
-        if surface.hdr_hw_luts {
+        if surface.hdr_enabled {
             if let (Some(ref mut pipeline), Some(ref hdr_config)) =
                 (&mut surface.crtc_color_pipeline, &surface.hdr_config)
             {
@@ -1694,14 +1668,14 @@ impl Tty {
                 ) {
                     warn!("error re-programming CRTC pipeline with EDID data: {err:?}");
                     pipeline.clear(&device.drm);
-                    surface.hdr_hw_luts = false;
+                    surface.hdr_enabled = false;
                     surface.crtc_color_pipeline = None;
                 }
             }
         }
 
         // Apply ICC gamma ramp if profile is loaded (skip when hardware HDR pipeline owns GAMMA_LUT).
-        if !surface.hdr_hw_luts {
+        if !surface.hdr_enabled {
             if let (Some(gamma_props), Some(color_profile)) =
                 (&mut surface.gamma_props, &surface.color_profile)
             {
@@ -2067,180 +2041,14 @@ impl Tty {
             }
         }
 
-        // When HDR is enabled, we render all elements to an offscreen texture first,
-        // then apply tone mapping (sRGB→PQ) as a post-processing pass, and submit the
-        // single tone-mapped texture to the DRM compositor.
-        let hdr_enabled = surface.hdr_enabled;
-        let hdr_hw_luts = surface.hdr_hw_luts;
-        let hdr_config = surface.hdr_config;
-        let edid_color_info = surface.edid_color_info.clone();
-        // Use the swapchain format for tone map output (typically 10-bit for HDR).
-        let swapchain_format = surface.compositor.format();
-
         // Render the elements.
-        let mut elements: Vec<OutputRenderElements<TtyRenderer<'_>>>;
-        let mut hdr_elements_storage: Vec<OutputRenderElements<TtyRenderer<'_>>> = Vec::new();
+        // When HDR is enabled with hardware CRTC LUTs, we composite normally in sRGB —
+        // the hardware does sRGB→linear→gamut→PQ at scanout time, zero GPU overhead.
+        let mut elements =
+            niri.render::<TtyRenderer>(&mut renderer, output, true, RenderTarget::Output);
 
-        if hdr_enabled && !hdr_hw_luts {
-            let hdr_config = hdr_config.unwrap();
-            // SDR reference white in cd/m² — this is the luminance that sRGB 1.0 maps to.
-            let src_max_lum = hdr_config.reference_luminance as f32;
-            let dst_max_lum = hdr_config.max_luminance as f32;
-
-            // HDR path: render to offscreen GlesTexture, tone map, wrap as single element.
-            let tone_mapped = (|| -> anyhow::Result<_> {
-                let output_mode = output.current_mode().unwrap();
-                let output_transform = output.current_transform();
-                let output_size = output_transform.transform_size(output_mode.size);
-                let output_scale = output.current_scale().fractional_scale().into();
-
-                let gles = renderer.as_gles_renderer();
-
-                // Reuse cached textures if the size matches, otherwise reallocate.
-                let need_alloc = match &surface.hdr_textures {
-                    Some((_, _, _, cached_size)) => *cached_size != output_size,
-                    None => true,
-                };
-                if need_alloc {
-                    use smithay::backend::renderer::Offscreen;
-                    let buf_size = output_size.to_logical(1).to_buffer(1, Transform::Normal);
-                    // FP16 linear-light buffer for HDR compositing.
-                    let fp16_tex: GlesTexture = gles
-                        .create_buffer(Fourcc::Abgr16161616f, buf_size)
-                        .context("error creating FP16 offscreen texture")?;
-                    let tm_tex: GlesTexture = gles
-                        .create_buffer(swapchain_format, buf_size)
-                        .context("error creating tone map output texture")?;
-                    let tm_buffer =
-                        crate::render_helpers::texture::TextureBuffer::from_texture(
-                            gles,
-                            tm_tex.clone(),
-                            output_scale,
-                            output_transform,
-                            Vec::new(),
-                        );
-                    surface.hdr_textures =
-                        Some((fp16_tex, tm_tex, tm_buffer, output_size));
-                }
-                let (fp16_texture, tm_texture, _, _) =
-                    surface.hdr_textures.as_ref().unwrap();
-
-                // Get the linearize shader program.
-                let linearize_program = shaders::Shaders::get(gles)
-                    .linearize_surface
-                    .clone()
-                    .context("linearize_surface shader not compiled")?;
-
-                // Render all elements using GlesRenderer to the cached offscreen texture.
-                let gles_elements = niri.render::<GlesRenderer>(
-                    gles,
-                    output,
-                    true,
-                    RenderTarget::Output,
-                );
-
-                // Render elements to FP16 linear-light buffer with per-surface linearization.
-                {
-                    let mut fp16_tex = fp16_texture.clone();
-                    let mut target = gles.bind(&mut fp16_tex)
-                        .context("error binding FP16 offscreen texture")?;
-                    let _sync = crate::render_helpers::render_elements_hdr(
-                        gles,
-                        &mut target,
-                        output_size,
-                        output_scale,
-                        output_transform,
-                        gles_elements.iter().rev(),
-                        linearize_program,
-                        src_max_lum,
-                    )
-                    .context("error rendering elements to FP16 texture")?;
-                }
-
-                // Encode Linear → PQ.
-                // src_max_lum = 1.0 because the FP16 buffer already contains
-                // absolute cd/m² values (Linear TF with max_lum=1.0 is a no-op).
-                shaders::apply_tone_map_to(
-                    gles,
-                    fp16_texture,
-                    tm_texture,
-                    output_size,
-                    3,              // src_tf: Linear
-                    1,              // dst_tf: PQ
-                    1.0,            // src_max_lum: values already absolute cd/m²
-                    dst_max_lum,
-                    {
-                        // Convert from sRGB/BT.709 to the monitor's native gamut
-                        // (from EDID). If EDID is unavailable, fall back to BT.2020.
-                        let dst_primaries = edid_color_info
-                            .as_ref()
-                            .map(|ci| crate::color::Primaries {
-                                r_x: ci.red.0,
-                                r_y: ci.red.1,
-                                g_x: ci.green.0,
-                                g_y: ci.green.1,
-                                b_x: ci.blue.0,
-                                b_y: ci.blue.1,
-                                w_x: ci.white.0,
-                                w_y: ci.white.1,
-                            })
-                            .unwrap_or(crate::color::BT2020_PRIMARIES);
-                        let m = crate::color::gamut_conversion_matrix(
-                            &crate::color::SRGB_PRIMARIES,
-                            &dst_primaries,
-                        );
-                        Mat3::from_cols_array_2d(&m).transpose()
-                    },
-                )
-                .context("error applying tone map")?;
-
-                // Reuse the cached TextureBuffer (stable Id for damage tracking)
-                // and increment its commit counter to signal new content.
-                let (_, _, tm_buffer, _) =
-                    surface.hdr_textures.as_mut().unwrap();
-                tm_buffer.increment_commit_counter();
-                let tm_buffer_clone = tm_buffer.clone();
-                let logical_size = tm_buffer_clone.logical_size();
-                let elem =
-                    crate::render_helpers::texture::TextureRenderElement::from_texture_buffer(
-                        tm_buffer_clone,
-                        (0., 0.),
-                        1.0,
-                        None,
-                        Some(logical_size),
-                        Kind::Unspecified,
-                    );
-                Ok(OutputRenderElements::Texture(
-                    PrimaryGpuTextureRenderElement(elem),
-                ))
-            })();
-
-            match tone_mapped {
-                Ok(elem) => {
-                    hdr_elements_storage.push(elem);
-                    // Use the single tone-mapped element.
-                    elements = Vec::new();
-                }
-                Err(err) => {
-                    warn!("HDR tone mapping failed, falling back to normal render: {err:?}");
-                    // Fall back to normal render path.
-                    elements = niri.render::<TtyRenderer>(
-                        &mut renderer,
-                        output,
-                        true,
-                        RenderTarget::Output,
-                    );
-                }
-            }
-        } else {
-            elements =
-                niri.render::<TtyRenderer>(&mut renderer, output, true, RenderTarget::Output);
-        }
-
-        let render_elements = if !hdr_elements_storage.is_empty() {
-            &hdr_elements_storage
-        } else {
-            // Visualize the damage, if enabled.
+        // Visualize the damage, if enabled.
+        let render_elements = {
             if niri.debug_draw_damage {
                 let output_state = niri.output_state.get_mut(output).unwrap();
                 draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
@@ -2275,15 +2083,6 @@ impl Tty {
                 if output_state.frame_clock.vrr() {
                     flags.insert(FrameFlags::SKIP_CURSOR_ONLY_UPDATES);
                 }
-            }
-
-            // When GPU HDR tone mapping is active, disable direct scanout since all content
-            // must go through the GPU composition + tone mapping pass.
-            // With hardware CRTC LUTs, scanout is fine — the hardware does the conversion.
-            if hdr_enabled && !hdr_hw_luts {
-                flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT);
-                flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY);
-                flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
             }
 
             flags
@@ -2823,7 +2622,7 @@ impl Tty {
 
                     // Apply gamma ramp fallback if profile loaded, or reset it.
                     // Skip when hardware HDR pipeline owns GAMMA_LUT.
-                    if !surface.hdr_hw_luts {
+                    if !surface.hdr_enabled {
                         if let Some(gamma_props) = &mut surface.gamma_props {
                             let gamma = surface
                                 .color_profile
@@ -4008,48 +3807,6 @@ fn find_colorspace_bt2020_value(
 
     // Fall back to the well-known kernel constant.
     Some((info.handle(), DRM_MODE_COLORIMETRY_BT2020_RGB))
-}
-
-/// Try to set NVIDIA's NV_CRTC_REGAMMA_TF property to PQ for hardware tone mapping.
-fn try_set_nvidia_pq_regamma(drm: &DrmDevice, crtc: crtc::Handle) {
-    // NV_CRTC_REGAMMA_TF enum value for PQ varies. Look for the property and PQ enum entry.
-    if let Some((handle, info, _value)) = find_drm_property(drm, crtc, "NV_CRTC_REGAMMA_TF") {
-        if let property::ValueType::Enum(entries) = info.value_type() {
-            let (_raw_values, enums) = entries.values();
-            for entry in enums {
-                if entry.name().to_str() == Ok("PQ") {
-                    match drm.set_property(crtc, handle, entry.value()) {
-                        Ok(()) => {
-                            debug!("set NV_CRTC_REGAMMA_TF to PQ for crtc {crtc:?}");
-                            return;
-                        }
-                        Err(err) => {
-                            warn!("failed to set NV_CRTC_REGAMMA_TF: {err:?}");
-                            return;
-                        }
-                    }
-                }
-            }
-            debug!("NV_CRTC_REGAMMA_TF has no PQ entry");
-        }
-    } else {
-        trace!("NV_CRTC_REGAMMA_TF property not found (not NVIDIA?)");
-    }
-}
-
-/// Reset NV_CRTC_REGAMMA_TF to Default if available.
-fn try_reset_nvidia_regamma(drm: &DrmDevice, crtc: crtc::Handle) {
-    if let Some((handle, info, _value)) = find_drm_property(drm, crtc, "NV_CRTC_REGAMMA_TF") {
-        if let property::ValueType::Enum(entries) = info.value_type() {
-            let (_raw_values, enums) = entries.values();
-            for entry in enums {
-                if entry.name().to_str() == Ok("Default") {
-                    let _ = drm.set_property(crtc, handle, entry.value());
-                    return;
-                }
-            }
-        }
-    }
 }
 
 fn reset_hdr(props: &ConnectorProperties, crtc: crtc::Handle) -> anyhow::Result<()> {
