@@ -1608,11 +1608,22 @@ impl Tty {
                     compositor.surface().set_extra_connector_properties(conn_props);
                     debug!("queued HDR connector properties for {connector_name}");
 
-                    // TODO: CRTC color pipeline disabled for testing — isolate whether
-                    // connector props alone pass NVIDIA's atomic test.
-                    debug!(
-                        "skipping CRTC color pipeline for {connector_name} (testing connector props only)"
-                    );
+                    // Set up CRTC color pipeline (DEGAMMA_LUT → CTM → GAMMA_LUT) if
+                    // the hardware supports it.
+                    let pipeline = CrtcColorPipeline::new(&device.drm, crtc);
+                    if let Some(mut pipeline) = pipeline {
+                        let crtc_props = pipeline.build_hdr_props(
+                            &device.drm,
+                            edid_color_info.as_ref(),
+                            hdr_config,
+                        )?;
+                        compositor.surface().set_extra_crtc_properties(crtc_props);
+                        crtc_color_pipeline = Some(pipeline);
+                        debug!("queued CRTC color pipeline for {connector_name}");
+                    } else {
+                        debug!("CRTC color pipeline not available for {connector_name} (missing properties)");
+                    }
+
                     Ok(())
                 })();
 
