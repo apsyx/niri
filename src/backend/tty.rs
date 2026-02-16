@@ -1331,43 +1331,8 @@ impl Tty {
         debug!("picking mode: {mode:?}");
 
         let mut orientation = None;
-        let mut hdr_active = false;
-        let mut crtc_color_pipeline = None;
         if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
-            if let Some(ref hdr_config) = config.hdr {
-                // HDR requires the full hardware pipeline:
-                // 1. HDR_OUTPUT_METADATA + Colorspace on the connector (so the display enters HDR mode)
-                // 2. CRTC DEGAMMA_LUT → CTM → GAMMA_LUT (sRGB→linear, gamut conversion, linear→PQ)
-                // If either fails, fall back to SDR — a GPU shader fallback is too expensive.
-                let hdr_ok = (|| -> anyhow::Result<()> {
-                    set_hdr_output_metadata(&props, crtc, None, hdr_config)?;
-                    debug!("set HDR output metadata for {connector_name}");
-
-                    let mut pipeline = CrtcColorPipeline::new(&device.drm, crtc)
-                        .context("CRTC missing DEGAMMA_LUT/CTM/GAMMA_LUT properties")?;
-                    pipeline
-                        .program_hdr(&device.drm, None, hdr_config)
-                        .context("failed to program CRTC color pipeline")?;
-                    debug!(
-                        "programmed CRTC color pipeline for {connector_name} (hardware HDR)"
-                    );
-                    crtc_color_pipeline = Some(pipeline);
-                    Ok(())
-                })();
-
-                match hdr_ok {
-                    Ok(()) => hdr_active = true,
-                    Err(err) => {
-                        warn!("HDR not available for {connector_name}, falling back to SDR: {err:?}");
-                        // Clean up any partial state.
-                        if let Some(ref mut pipeline) = crtc_color_pipeline {
-                            pipeline.clear(&device.drm);
-                            crtc_color_pipeline = None;
-                        }
-                        let _ = reset_hdr(&props, crtc);
-                    }
-                }
-            } else {
+            if config.hdr.is_none() {
                 match reset_hdr(&props, crtc) {
                     Ok(()) => (),
                     Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
@@ -1610,12 +1575,50 @@ impl Tty {
         let edid_color_info = get_edid_info(&device.drm, connector.handle())
             .ok()
             .and_then(|info| crate::color::edid_color_info(&info));
+
+        // Set up HDR now that the CRTC is active (has valid ACTIVE + MODE_ID).
+        // NVIDIA requires full pipeline state in atomic commits, so this must happen
+        // after create_surface / DrmCompositor::new which do the initial modeset.
+        let mut hdr_active = false;
+        let mut crtc_color_pipeline = None;
+        if let Some(ref hdr_config) = config.hdr {
+            if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
+                let hdr_ok = (|| -> anyhow::Result<()> {
+                    set_hdr_output_metadata(&props, crtc, edid_color_info.as_ref(), hdr_config)?;
+                    debug!("set HDR output metadata for {connector_name}");
+
+                    let mut pipeline = CrtcColorPipeline::new(&device.drm, crtc)
+                        .context("CRTC missing DEGAMMA_LUT/CTM/GAMMA_LUT properties")?;
+                    pipeline
+                        .program_hdr(&device.drm, edid_color_info.as_ref(), hdr_config)
+                        .context("failed to program CRTC color pipeline")?;
+                    debug!(
+                        "programmed CRTC color pipeline for {connector_name} (hardware HDR)"
+                    );
+                    crtc_color_pipeline = Some(pipeline);
+                    Ok(())
+                })();
+
+                match hdr_ok {
+                    Ok(()) => hdr_active = true,
+                    Err(err) => {
+                        warn!("HDR not available for {connector_name}, falling back to SDR: {err:?}");
+                        if let Some(ref mut pipeline) = crtc_color_pipeline {
+                            pipeline.clear(&device.drm);
+                            crtc_color_pipeline = None;
+                        }
+                        let _ = reset_hdr(&props, crtc);
+                    }
+                }
+            }
+        }
+
         output
             .user_data()
             .insert_if_missing(|| OutputEdidColorInfo(edid_color_info.clone()));
         output
             .user_data()
-            .insert_if_missing(|| OutputHdrEnabled(config.hdr.is_some()));
+            .insert_if_missing(|| OutputHdrEnabled(hdr_active));
         output
             .user_data()
             .insert_if_missing(|| OutputHdrConfig(config.hdr));
@@ -1655,26 +1658,8 @@ impl Tty {
         let res = device.surfaces.insert(crtc, surface);
         assert!(res.is_none(), "crtc must not have already existed");
 
-        // Re-program CRTC color pipeline with EDID data now that it's available.
-        let surface = device.surfaces.get_mut(&crtc).unwrap();
-        if surface.hdr_enabled {
-            if let (Some(ref mut pipeline), Some(ref hdr_config)) =
-                (&mut surface.crtc_color_pipeline, &surface.hdr_config)
-            {
-                if let Err(err) = pipeline.program_hdr(
-                    &device.drm,
-                    surface.edid_color_info.as_ref(),
-                    hdr_config,
-                ) {
-                    warn!("error re-programming CRTC pipeline with EDID data: {err:?}");
-                    pipeline.clear(&device.drm);
-                    surface.hdr_enabled = false;
-                    surface.crtc_color_pipeline = None;
-                }
-            }
-        }
-
         // Apply ICC gamma ramp if profile is loaded (skip when hardware HDR pipeline owns GAMMA_LUT).
+        let surface = device.surfaces.get_mut(&crtc).unwrap();
         if !surface.hdr_enabled {
             if let (Some(gamma_props), Some(color_profile)) =
                 (&mut surface.gamma_props, &surface.color_profile)
