@@ -1614,7 +1614,6 @@ impl Tty {
                     if let Some(mut pipeline) = pipeline {
                         let crtc_props = pipeline.build_hdr_props(
                             &device.drm,
-                            edid_color_info.as_ref(),
                             hdr_config,
                         )?;
                         compositor.surface().set_extra_crtc_properties(crtc_props);
@@ -3003,7 +3002,6 @@ impl CrtcColorPipeline {
     fn build_hdr_props(
         &mut self,
         device: &DrmDevice,
-        edid_color_info: Option<&crate::color::EdidColorInfo>,
         hdr_config: &niri_config::output::HdrConfig,
     ) -> anyhow::Result<Vec<(property::Handle, u64)>> {
         use crate::color;
@@ -3025,20 +3023,11 @@ impl CrtcColorPipeline {
             NonZeroU64::new(u64::from(blob.blob_id))
         };
 
-        // --- CTM: sRGB/BT.709 → monitor gamut ---
-        let dst_primaries = edid_color_info
-            .map(|ci| crate::color::Primaries {
-                r_x: ci.red.0,
-                r_y: ci.red.1,
-                g_x: ci.green.0,
-                g_y: ci.green.1,
-                b_x: ci.blue.0,
-                b_y: ci.blue.1,
-                w_x: ci.white.0,
-                w_y: ci.white.1,
-            })
-            .unwrap_or(color::BT2020_PRIMARIES);
-        let matrix = color::gamut_conversion_matrix(&color::SRGB_PRIMARIES, &dst_primaries);
+        // --- CTM: sRGB/BT.709 → BT.2020 ---
+        // Convert to BT.2020 to match the Colorspace signaling (BT2020_RGB).
+        // The display's EDID primaries are used in HDR_OUTPUT_METADATA for tone
+        // mapping reference, not as the encoding target.
+        let matrix = color::gamut_conversion_matrix(&color::SRGB_PRIMARIES, &color::BT2020_PRIMARIES);
         let ctm_data = color::matrix_to_drm_ctm(&matrix);
         let ctm_blob = {
             let mut bytes = bytemuck::bytes_of(&ctm_data).to_vec();
