@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use knuffel::ast::SpannedNode;
@@ -9,6 +10,24 @@ use niri_ipc::{ConfiguredMode, HSyncPolarity, Transform, VSyncPolarity};
 
 use crate::gestures::HotCorners;
 use crate::{Color, FloatOrInt, LayoutPart};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorDepth {
+    Depth8,
+    Depth10,
+}
+
+impl FromStr for ColorDepth {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "8" => Ok(Self::Depth8),
+            "10" => Ok(Self::Depth10),
+            _ => Err(r#"valid values are "8" and "10""#),
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Outputs(pub Vec<Output>);
@@ -72,10 +91,30 @@ pub struct Output {
     pub background_color: Option<Color>,
     #[knuffel(child)]
     pub backdrop_color: Option<Color>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub color_depth: Option<ColorDepth>,
+    #[knuffel(child, unwrap(argument))]
+    pub icc_profile: Option<PathBuf>,
     #[knuffel(child)]
     pub hot_corners: Option<HotCorners>,
     #[knuffel(child)]
     pub layout: Option<LayoutPart>,
+    #[knuffel(child)]
+    pub hdr: Option<HdrConfig>,
+}
+
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct HdrConfig {
+    /// Peak luminance of the display in cd/m².
+    #[knuffel(child, unwrap(argument), default = 1000)]
+    pub max_luminance: u32,
+    /// SDR reference white level in cd/m².
+    #[knuffel(child, unwrap(argument), default = 203)]
+    pub reference_luminance: u32,
+    /// Minimum luminance in 0.0001 cd/m² units (e.g. 500 = 0.05 cd/m²).
+    /// If not set, defaults to 500.
+    #[knuffel(child, unwrap(argument), default = 500)]
+    pub min_luminance: u32,
 }
 
 impl Output {
@@ -106,8 +145,11 @@ impl Default for Output {
             variable_refresh_rate: None,
             background_color: None,
             backdrop_color: None,
+            color_depth: None,
+            icc_profile: None,
             hot_corners: None,
             layout: None,
+            hdr: None,
         }
     }
 }

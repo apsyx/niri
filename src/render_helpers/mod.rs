@@ -1,4 +1,5 @@
 use std::ptr;
+use std::sync::atomic::Ordering;
 
 use anyhow::{ensure, Context as _};
 use niri_config::BlockOutFrom;
@@ -8,7 +9,7 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, Kind, RenderElement, RenderElementStates};
 use smithay::backend::renderer::gles::{
-    GlesError, GlesMapping, GlesRenderer, GlesTarget, GlesTexture,
+    GlesError, GlesMapping, GlesRenderer, GlesTarget, GlesTexProgram, GlesTexture, Uniform,
 };
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
@@ -365,7 +366,7 @@ pub fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::
     frame.finish().context("error finishing frame")
 }
 
-fn render_elements(
+pub fn render_elements(
     renderer: &mut GlesRenderer,
     target: &mut GlesTarget,
     size: Size<i32, Physical>,
@@ -404,4 +405,69 @@ fn render_elements(
     }
 
     frame.finish().context("error finishing frame")
+}
+
+/// Render elements into an FP16 linear-light buffer for HDR compositing.
+///
+/// Like `render_elements()`, but sets a linearize texture override before each element
+/// so that sRGB surfaces are decoded to linear light. Elements with their own shader
+/// (ClippedSurface, GradientFade) will clear and re-set the override themselves,
+/// reading `hdr_ref_lum` from `Shaders` for their own linearization.
+#[allow(clippy::too_many_arguments)]
+pub fn render_elements_hdr(
+    renderer: &mut GlesRenderer,
+    target: &mut GlesTarget,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    transform: Transform,
+    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    linearize_program: GlesTexProgram,
+    ref_lum: f32,
+) -> anyhow::Result<SyncPoint> {
+    use self::shaders::Shaders;
+
+    // Set hdr_ref_lum BEFORE creating the frame so ClippedSurface/GradientFade can read it.
+    Shaders::get(renderer)
+        .hdr_ref_lum
+        .store(ref_lum.to_bits(), Ordering::Relaxed);
+
+    let transform = transform.invert();
+    let output_rect = Rectangle::from_size(transform.transform_size(size));
+
+    let mut frame = renderer
+        .render(target, size, transform)
+        .context("error starting frame")?;
+
+    frame
+        .clear(Color32F::TRANSPARENT, &[output_rect])
+        .context("error clearing")?;
+
+    let linearize_uniforms = vec![Uniform::new("ref_lum", ref_lum)];
+    for element in elements {
+        let src = element.src();
+        let dst = element.geometry(scale);
+
+        if let Some(mut damage) = output_rect.intersection(dst) {
+            damage.loc -= dst.loc;
+            // Re-set the linearize override before each element, because
+            // ClippedSurface/GradientFade clear it after drawing.
+            frame.override_default_tex_program(
+                linearize_program.clone(),
+                linearize_uniforms.clone(),
+            );
+            element
+                .draw(&mut frame, src, dst, &[damage], &[], None)
+                .context("error drawing element")?;
+        }
+    }
+
+    let sync = frame.finish().context("error finishing frame")?;
+
+    // Clear HDR state so subsequent non-HDR rendering is unaffected.
+    // Safe to call get() again now that the frame is finished.
+    Shaders::get(renderer)
+        .hdr_ref_lum
+        .store(0f32.to_bits(), Ordering::Relaxed);
+
+    Ok(sync)
 }

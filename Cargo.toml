@@ -27,14 +27,14 @@ tracy-client = { version = "0.18.4", default-features = false }
 
 [workspace.dependencies.smithay]
 # version = "0.4.1"
-git = "https://github.com/Smithay/smithay.git"
-rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+git = "https://github.com/apsyx/smithay.git"
+rev = "636e029f6cb2746d0a13f66a92ad008b91832cb8"
 default-features = false
 
 [workspace.dependencies.smithay-drm-extras]
 # version = "0.1.0"
-git = "https://github.com/Smithay/smithay.git"
-rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+git = "https://github.com/apsyx/smithay.git"
+rev = "636e029f6cb2746d0a13f66a92ad008b91832cb8"
 # path = "../smithay/smithay-drm-extras"
 
 [package]
@@ -75,8 +75,9 @@ git-version = "0.3.9"
 glam = "0.32.1"
 input = { version = "0.10.0", features = ["libinput_1_21"] }
 keyframe = { version = "1.1.1", default-features = false }
+lcms2 = "6"
 libc = "0.2.185"
-libdisplay-info = "0.3.0"
+libdisplay-info = { version = "0.3.0", features = ["v0_2"] }
 log = { version = "0.4.29", features = ["max_level_trace", "release_max_level_debug"] }
 niri-config = { version = "26.4.0", path = "niri-config" }
 niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }
@@ -188,3 +189,6 @@ assets = [
     ["resources/niri.service", "/usr/lib/systemd/user/", "644"],
     ["resources/niri-shutdown.target", "/usr/lib/systemd/user/", "644"],
 ]
+
+[patch.crates-io]
+wayland-backend = { git = "https://github.com/apsyx/wayland-backend-patched.git", branch = "wayland-backend-0.3.15" }

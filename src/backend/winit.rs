@@ -251,6 +251,7 @@ impl Winit {
         };
 
         niri.update_primary_scanout_output(output, &res.states);
+        niri.notify_color_preferred_changed();
 
         let rv;
         if let Some(damage) = res.damage {

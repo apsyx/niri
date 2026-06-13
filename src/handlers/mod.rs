@@ -24,6 +24,7 @@ use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Point, Rectangle, Serial};
+use smithay::desktop::utils::surface_primary_scanout_output;
 use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_lease::{
@@ -80,6 +81,11 @@ use crate::protocols::ext_workspace::{self, ExtWorkspaceHandler, ExtWorkspaceMan
 use crate::protocols::foreign_toplevel::{
     self, ForeignToplevelHandler, ForeignToplevelManagerState,
 };
+use crate::protocols::color_management::{
+    ColorManagementHandler, ColorManagementState, ImageDescription, SurfaceColorDescription,
+};
+#[cfg(not(test))]
+use crate::protocols::color_management::{LuminanceRange, Primaries, TransferFunction};
 use crate::protocols::gamma_control::{GammaControlHandler, GammaControlManagerState};
 use crate::protocols::mutter_x11_interop::MutterX11InteropHandler;
 use crate::protocols::output_management::{OutputManagementHandler, OutputManagementManagerState};
@@ -91,9 +97,9 @@ use crate::protocols::virtual_pointer::{
 };
 use crate::utils::{output_size, send_scale_transform};
 use crate::{
-    delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control,
-    delegate_mutter_x11_interop, delegate_output_management, delegate_screencopy,
-    delegate_virtual_pointer,
+    delegate_color_management, delegate_ext_workspace, delegate_foreign_toplevel,
+    delegate_gamma_control, delegate_mutter_x11_interop, delegate_output_management,
+    delegate_screencopy, delegate_virtual_pointer,
 };
 
 pub const XDG_ACTIVATION_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -767,6 +773,94 @@ impl GammaControlHandler for State {
     }
 }
 delegate_gamma_control!(State);
+
+impl ColorManagementHandler for State {
+    fn color_management_state(&mut self) -> &mut ColorManagementState {
+        &mut self.niri.color_management_state
+    }
+
+    fn get_surface_preferred_description(&self, surface: &WlSurface) -> ImageDescription {
+        let output = with_states(surface, |states| {
+            surface_primary_scanout_output(surface, states)
+        });
+        match output {
+            Some(output) => self.get_output_color_description(&output),
+            None => ImageDescription::Srgb,
+        }
+    }
+
+    fn get_output_color_description(&self, _output: &Output) -> ImageDescription {
+        #[cfg(not(test))]
+        {
+            let hdr_enabled = _output
+                .user_data()
+                .get::<crate::backend::tty::OutputHdrEnabled>()
+                .map(|h| h.0)
+                .unwrap_or(false);
+
+            let hdr_config = _output
+                .user_data()
+                .get::<crate::backend::tty::OutputHdrConfig>()
+                .and_then(|h| h.0);
+
+            let edid = _output
+                .user_data()
+                .get::<crate::backend::tty::OutputEdidColorInfo>()
+                .and_then(|e| e.0.clone());
+
+            // Build primaries from EDID if available.
+            let primaries = edid.map(|color_info| Primaries {
+                r_x: color_info.red.0,
+                r_y: color_info.red.1,
+                g_x: color_info.green.0,
+                g_y: color_info.green.1,
+                b_x: color_info.blue.0,
+                b_y: color_info.blue.1,
+                w_x: color_info.white.0,
+                w_y: color_info.white.1,
+            });
+
+            if hdr_enabled {
+                let luminance = hdr_config.map(|cfg| LuminanceRange {
+                    min: 0.005,
+                    max: cfg.max_luminance as f64,
+                    reference: cfg.reference_luminance as f64,
+                });
+                return ImageDescription::Parametric {
+                    primaries,
+                    tf: Some(TransferFunction::Pq),
+                    luminance,
+                };
+            }
+
+            if primaries.is_some() {
+                return ImageDescription::Parametric {
+                    primaries,
+                    tf: Some(TransferFunction::Srgb),
+                    luminance: None,
+                };
+            }
+        }
+
+        ImageDescription::Srgb
+    }
+
+    fn surface_color_changed(&mut self, surface: &WlSurface, desc: &SurfaceColorDescription) {
+        // Store the color description in the surface's data map using a RefCell wrapper.
+        with_states(surface, |data| {
+            use std::cell::RefCell;
+            data.data_map
+                .insert_if_missing(|| RefCell::new(SurfaceColorDescription::default()));
+            if let Some(stored) = data.data_map.get::<RefCell<SurfaceColorDescription>>() {
+                *stored.borrow_mut() = desc.clone();
+            }
+        });
+
+        // Queue a redraw on all outputs since we don't track which output this surface is on.
+        self.niri.queue_redraw_all();
+    }
+}
+delegate_color_management!(State);
 
 struct UrgentOnlyMarker;
 

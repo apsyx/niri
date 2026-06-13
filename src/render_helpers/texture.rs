@@ -87,6 +87,12 @@ impl<T: Texture> TextureBuffer<T> {
         )
     }
 
+    /// Signal that the texture content has been updated.
+    /// Increments the commit counter so damage tracking sees the change.
+    pub fn increment_commit_counter(&mut self) {
+        self.commit_counter.increment();
+    }
+
     pub fn texture(&self) -> &T {
         &self.texture
     }

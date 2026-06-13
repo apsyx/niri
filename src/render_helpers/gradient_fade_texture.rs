@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
@@ -99,7 +101,14 @@ impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        let uniforms = vec![Uniform::new("cutoff", self.cutoff)];
+        let ref_lum = {
+            let shaders = Shaders::get_from_frame(frame);
+            f32::from_bits(shaders.hdr_ref_lum.load(Ordering::Relaxed))
+        };
+        let uniforms = vec![
+            Uniform::new("cutoff", self.cutoff),
+            Uniform::new("ref_lum", ref_lum),
+        ];
         frame.override_default_tex_program(self.program.0.clone(), uniforms);
         RenderElement::<GlesRenderer>::draw(
             &self.inner,

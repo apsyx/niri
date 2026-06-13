@@ -70,7 +70,12 @@ use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
-const SUPPORTED_COLOR_FORMATS: [Fourcc; 4] = [
+const SUPPORTED_COLOR_FORMATS: [Fourcc; 6] = [
+    // 10-bit formats must be BGR order — Smithay's GlesRenderer only maps
+    // Abgr2101010/Xbgr2101010 to GL_RGB10_A2. The RGB variants (Argb2101010,
+    // Xrgb2101010) have no GL format mapping and will crash the renderer.
+    Fourcc::Abgr2101010,
+    Fourcc::Xbgr2101010,
     Fourcc::Xrgb8888,
     Fourcc::Xbgr8888,
     Fourcc::Argb8888,
@@ -370,6 +375,18 @@ struct TtyOutputState {
     crtc: crtc::Handle,
 }
 
+/// Wrapper for storing EDID color info in output user_data.
+#[derive(Debug, Clone)]
+pub struct OutputEdidColorInfo(pub Option<crate::color::EdidColorInfo>);
+
+/// Whether HDR output mode is enabled on this output.
+#[derive(Debug, Clone, Copy)]
+pub struct OutputHdrEnabled(pub bool);
+
+/// HDR config for this output (if any).
+#[derive(Debug, Clone)]
+pub struct OutputHdrConfig(pub Option<niri_config::output::HdrConfig>);
+
 struct Surface {
     name: OutputName,
     compositor: GbmDrmCompositor,
@@ -378,6 +395,21 @@ struct Surface {
     gamma_props: Option<GammaProps>,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
+    /// Whether this surface has color management active (ICC profile or protocol).
+    /// When true, HDR properties are not reset on this connector.
+    color_managed: bool,
+    /// Parsed ICC color profile and LUT for this output.
+    color_profile: Option<crate::color::OutputColorProfile>,
+    /// Cached GL 3D LUT texture name for color correction.
+    lut_texture: Option<u32>,
+    /// Color information extracted from the EDID. Used by the color management protocol.
+    edid_color_info: Option<crate::color::EdidColorInfo>,
+    /// Whether HDR output mode is enabled on this connector.
+    hdr_enabled: bool,
+    /// HDR configuration from the config file.
+    hdr_config: Option<niri_config::output::HdrConfig>,
+    /// Hardware CRTC color pipeline (DEGAMMA_LUT → CTM → GAMMA_LUT) for HDR.
+    crtc_color_pipeline: Option<CrtcColorPipeline>,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -399,6 +431,23 @@ struct GammaProps {
     gamma_lut: property::Handle,
     gamma_lut_size: property::Handle,
     previous_blob: Option<NonZeroU64>,
+}
+
+/// Hardware CRTC color pipeline for HDR: DEGAMMA_LUT → CTM → GAMMA_LUT.
+///
+/// When available, this eliminates the GPU tone-mapping pass entirely by programming
+/// the display hardware to do sRGB→linear (degamma), BT.709→BT.2020 (CTM), and
+/// linear→PQ (gamma) at scanout time.
+struct CrtcColorPipeline {
+    crtc: crtc::Handle,
+    degamma_lut: property::Handle,
+    degamma_lut_size: property::Handle,
+    ctm: property::Handle,
+    gamma_lut: property::Handle,
+    gamma_lut_size: property::Handle,
+    previous_degamma_blob: Option<NonZeroU64>,
+    previous_ctm_blob: Option<NonZeroU64>,
+    previous_gamma_blob: Option<NonZeroU64>,
 }
 
 struct ConnectorProperties<'a> {
@@ -679,13 +728,39 @@ impl Tty {
                         if let Ok(props) =
                             ConnectorProperties::try_new(&device.drm, surface.connector)
                         {
-                            match reset_hdr(&props) {
-                                Ok(()) => (),
-                                Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
+                            if surface.hdr_enabled {
+                                // Re-apply HDR connector props on session resume.
+                                if let Some(ref hdr_config) = surface.hdr_config {
+                                    match build_hdr_connector_props(
+                                        &props,
+                                        surface.edid_color_info.as_ref(),
+                                        hdr_config,
+                                    ) {
+                                        Ok(hdr_props) => {
+                                            surface.compositor.surface().set_extra_connector_properties(hdr_props);
+                                        }
+                                        Err(err) => {
+                                            debug!("couldn't restore HDR properties: {err:?}")
+                                        }
+                                    }
+                                }
+                                // Restore hardware CRTC color pipeline.
+                                if let Some(ref pipeline) = surface.crtc_color_pipeline {
+                                    let crtc_props = pipeline.build_restore_props();
+                                    surface.compositor.surface().set_extra_crtc_properties(crtc_props);
+                                }
+                            } else if !surface.color_managed {
+                                match build_hdr_reset_props(&props) {
+                                    Ok(reset_props) if !reset_props.is_empty() => {
+                                        surface.compositor.surface().set_extra_connector_properties(reset_props);
+                                    }
+                                    Ok(_) => (),
+                                    Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
+                                }
                             }
                         } else {
                             warn!("failed to get connector properties");
-                        };
+                        }
 
                         if let Some(ramp) = surface.pending_gamma_change.take() {
                             let ramp = ramp.as_deref();
@@ -1303,9 +1378,23 @@ impl Tty {
 
         let mut orientation = None;
         if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
-            match reset_hdr(&props) {
-                Ok(()) => (),
-                Err(err) => debug!("couldn't reset HDR properties: {err:?}"),
+            if config.hdr.is_none() {
+                // Reset HDR properties from a previous session via legacy set_property.
+                // This runs before the DrmCompositor exists, so we can't use the surface API.
+                if let Ok((hdr_info, hdr_value)) = props.find(c"HDR_OUTPUT_METADATA") {
+                    if *hdr_value != 0 {
+                        let _ = device.drm.set_property(connector.handle(), hdr_info.handle(), 0);
+                    }
+                }
+                if let Ok((cs_info, cs_value)) = props.find(c"Colorspace") {
+                    if *cs_value != DRM_MODE_COLORIMETRY_DEFAULT {
+                        let _ = device.drm.set_property(
+                            connector.handle(),
+                            cs_info.handle(),
+                            DRM_MODE_COLORIMETRY_DEFAULT,
+                        );
+                    }
+                }
             }
 
             match get_panel_orientation(&props) {
@@ -1434,6 +1523,16 @@ impl Tty {
             })
             .collect::<FormatSet>();
 
+        // Filter color formats based on config.
+        let color_formats: Vec<Fourcc> = match config.color_depth {
+            Some(niri_config::ColorDepth::Depth8) => SUPPORTED_COLOR_FORMATS
+                .iter()
+                .copied()
+                .filter(|f| !matches!(f, Fourcc::Abgr2101010 | Fourcc::Xbgr2101010))
+                .collect(),
+            _ => SUPPORTED_COLOR_FORMATS.to_vec(),
+        };
+
         // Create the compositor.
         let res = DrmCompositor::new(
             OutputModeSource::Auto(output.downgrade()),
@@ -1441,7 +1540,7 @@ impl Tty {
             None,
             device.allocator.clone(),
             GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
-            SUPPORTED_COLOR_FORMATS,
+            color_formats.clone(),
             // This is only used to pick a good internal format, so it can use the surface's render
             // formats, even though we only ever render on the primary GPU.
             render_formats.clone(),
@@ -1471,7 +1570,7 @@ impl Tty {
                     None,
                     device.allocator.clone(),
                     GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
-                    SUPPORTED_COLOR_FORMATS,
+                    color_formats,
                     render_formats,
                     device.drm.cursor_size(),
                     Some(device.gbm.clone()),
@@ -1514,6 +1613,92 @@ impl Tty {
 
         let vrr_enabled = compositor.vrr_enabled();
 
+        // Load ICC profile if configured.
+        let color_profile = config.icc_profile.as_ref().and_then(|path| {
+            match crate::color::OutputColorProfile::from_icc(path) {
+                Ok(profile) => {
+                    debug!("loaded ICC profile for {connector_name}: {}", path.display());
+                    Some(profile)
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to load ICC profile for {connector_name}: {err:?}"
+                    );
+                    None
+                }
+            }
+        });
+
+        // Extract EDID color info.
+        let edid_color_info = get_edid_info(&device.drm, connector.handle())
+            .ok()
+            .and_then(|info| crate::color::edid_color_info(&info));
+
+        // Set up HDR connector properties to be included in the next modeset commit.
+        // HDR_OUTPUT_METADATA and Colorspace are modeset-level properties that must be
+        // part of an atomic commit with ALLOW_MODESET. We set them as extra properties
+        // on the DrmSurface so smithay applies them during the initial modeset.
+        let mut hdr_active = false;
+        let mut crtc_color_pipeline: Option<CrtcColorPipeline> = None;
+        if let Some(ref hdr_config) = config.hdr {
+            if let Ok(props) = ConnectorProperties::try_new(&device.drm, connector.handle()) {
+                let hdr_ok = (|| -> anyhow::Result<()> {
+                    let conn_props = build_hdr_connector_props(
+                        &props,
+                        edid_color_info.as_ref(),
+                        hdr_config,
+                    )?;
+                    compositor.surface().set_extra_connector_properties(conn_props);
+                    debug!("queued HDR connector properties for {connector_name}");
+
+                    // Set up CRTC color pipeline (DEGAMMA_LUT → CTM → GAMMA_LUT) if
+                    // the hardware supports it.
+                    let pipeline = CrtcColorPipeline::new(&device.drm, crtc);
+                    if let Some(mut pipeline) = pipeline {
+                        let crtc_props = pipeline.build_hdr_props(
+                            &device.drm,
+                            hdr_config,
+                        )?;
+                        compositor.surface().set_extra_crtc_properties(crtc_props);
+                        crtc_color_pipeline = Some(pipeline);
+                        debug!("queued CRTC color pipeline for {connector_name}");
+                    } else {
+                        debug!("CRTC color pipeline not available for {connector_name} (missing properties)");
+                    }
+
+                    Ok(())
+                })();
+
+                match hdr_ok {
+                    Ok(()) => hdr_active = true,
+                    Err(err) => {
+                        warn!("HDR not available for {connector_name}, falling back to SDR: {err:?}");
+                        if let Some(ref mut pipeline) = crtc_color_pipeline {
+                            let clear_props = pipeline.build_clear_props(&device.drm);
+                            compositor.surface().set_extra_crtc_properties(clear_props);
+                            crtc_color_pipeline = None;
+                        }
+                        compositor.surface().clear_extra_connector_properties();
+                        if let Ok(reset_props) = build_hdr_reset_props(&props) {
+                            if !reset_props.is_empty() {
+                                compositor.surface().set_extra_connector_properties(reset_props);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        output
+            .user_data()
+            .insert_if_missing(|| OutputEdidColorInfo(edid_color_info.clone()));
+        output
+            .user_data()
+            .insert_if_missing(|| OutputHdrEnabled(hdr_active));
+        output
+            .user_data()
+            .insert_if_missing(|| OutputHdrConfig(config.hdr));
+
         let vblank_frame_name =
             tracy_client::FrameName::new_leak(format!("vblank on {connector_name}"));
         let time_since_presentation_plot_name = tracy_client::PlotName::new_leak(format!(
@@ -1532,6 +1717,13 @@ impl Tty {
             dmabuf_feedback,
             gamma_props,
             pending_gamma_change: None,
+            color_managed: color_profile.is_some() || config.hdr.is_some(),
+            color_profile,
+            lut_texture: None,
+            edid_color_info,
+            hdr_enabled: hdr_active,
+            hdr_config: config.hdr,
+            crtc_color_pipeline,
             vblank_frame: None,
             vblank_frame_name,
             time_since_presentation_plot_name,
@@ -1541,6 +1733,20 @@ impl Tty {
 
         let res = device.surfaces.insert(crtc, surface);
         assert!(res.is_none(), "crtc must not have already existed");
+
+        // Apply ICC gamma ramp if profile is loaded (skip when hardware HDR pipeline owns GAMMA_LUT).
+        let surface = device.surfaces.get_mut(&crtc).unwrap();
+        if !surface.hdr_enabled {
+            if let (Some(gamma_props), Some(color_profile)) =
+                (&mut surface.gamma_props, &surface.color_profile)
+            {
+                if let Some(gamma) = &color_profile.gamma_ramp {
+                    if let Err(err) = gamma_props.set_gamma(&device.drm, Some(gamma)) {
+                        warn!("error applying initial ICC gamma ramp for {connector_name}: {err:?}");
+                    }
+                }
+            }
+        }
 
         niri.add_output(output.clone(), Some(refresh_interval(mode)), vrr_enabled);
 
@@ -1881,7 +2087,24 @@ impl Tty {
             }
         };
 
+        // Lazily upload 3D LUT texture if we have a color profile but no texture yet.
+        if surface.color_profile.is_some() && surface.lut_texture.is_none() {
+            if let Some(ref profile) = surface.color_profile {
+                match crate::color::upload_3d_lut_texture(renderer.as_gles_renderer(), &profile.lut_data) {
+                    Ok(tex) => {
+                        surface.lut_texture = Some(tex);
+                        debug!("uploaded 3D LUT texture for {}", surface.name.connector);
+                    }
+                    Err(err) => {
+                        warn!("failed to upload 3D LUT texture: {err:?}");
+                    }
+                }
+            }
+        }
+
         // Render the elements.
+        // When HDR is enabled with hardware CRTC LUTs, we composite normally in sRGB —
+        // the hardware does sRGB→linear→gamut→PQ at scanout time, zero GPU overhead.
         let ctx = RenderCtx {
             renderer: &mut renderer,
             target: RenderTarget::Output,
@@ -1890,10 +2113,13 @@ impl Tty {
         let mut elements = niri.render_to_vec(ctx, output, true);
 
         // Visualize the damage, if enabled.
-        if niri.debug_draw_damage {
-            let output_state = niri.output_state.get_mut(output).unwrap();
-            draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
-        }
+        let render_elements = {
+            if niri.debug_draw_damage {
+                let output_state = niri.output_state.get_mut(output).unwrap();
+                draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
+            }
+            &elements
+        };
 
         // Overlay planes are disabled by default as they cause weird performance issues on my
         // system.
@@ -1929,7 +2155,7 @@ impl Tty {
 
         // Hand them over to the DRM.
         let drm_compositor = &mut surface.compositor;
-        match drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags) {
+        match drm_compositor.render_frame::<_, _>(&mut renderer, render_elements, [0.; 4], flags) {
             Ok(res) => {
                 let needs_sync = res.needs_sync()
                     || self
@@ -1947,6 +2173,7 @@ impl Tty {
                 }
 
                 niri.update_primary_scanout_output(output, &res.states);
+                niri.notify_color_preferred_changed();
                 if let Some(dmabuf_feedback) = surface.dmabuf_feedback.as_ref() {
                     niri.send_dmabuf_feedbacks(output, dmabuf_feedback, &res.states);
                 }
@@ -2428,8 +2655,54 @@ impl Tty {
                 let change_always_vrr = vrr_enabled != config.is_vrr_always_on();
                 let is_on_demand_vrr = config.is_vrr_on_demand();
 
-                if !change_mode && !change_always_vrr && !is_on_demand_vrr {
+                // Check if the ICC profile changed.
+                let current_icc = surface.color_profile.is_some();
+                let icc_changed = match (&config.icc_profile, current_icc) {
+                    (Some(_), _) | (None, true) => true,
+                    (None, false) => false,
+                };
+
+                if !change_mode && !change_always_vrr && !is_on_demand_vrr && !icc_changed {
                     continue;
+                }
+
+                // Reload ICC profile if changed.
+                if icc_changed {
+                    let connector_name = &surface.name.connector;
+                    surface.color_profile = config.icc_profile.as_ref().and_then(|path| {
+                        match crate::color::OutputColorProfile::from_icc(path) {
+                            Ok(profile) => {
+                                debug!(
+                                    "reloaded ICC profile for {connector_name}: {}",
+                                    path.display()
+                                );
+                                Some(profile)
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "failed to reload ICC profile for {connector_name}: {err:?}"
+                                );
+                                None
+                            }
+                        }
+                    });
+                    surface.color_managed = surface.color_profile.is_some();
+
+                    // Apply gamma ramp fallback if profile loaded, or reset it.
+                    // Skip when hardware HDR pipeline owns GAMMA_LUT.
+                    if !surface.hdr_enabled {
+                        if let Some(gamma_props) = &mut surface.gamma_props {
+                            let gamma = surface
+                                .color_profile
+                                .as_ref()
+                                .and_then(|p| p.gamma_ramp.as_deref());
+                            if let Err(err) = gamma_props.set_gamma(&device.drm, gamma) {
+                                warn!(
+                                    "error applying ICC gamma ramp for {connector_name}: {err:?}"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let output = niri
@@ -2719,6 +2992,170 @@ impl GammaProps {
             .context("error setting GAMMA_LUT")?;
 
         Ok(())
+    }
+}
+
+impl CrtcColorPipeline {
+    /// Discover DEGAMMA_LUT, DEGAMMA_LUT_SIZE, CTM, GAMMA_LUT, GAMMA_LUT_SIZE on the CRTC.
+    /// Returns `None` if any property is missing (e.g. NVIDIA).
+    fn new(device: &DrmDevice, crtc: crtc::Handle) -> Option<Self> {
+        let props = device.get_properties(crtc).ok()?;
+
+        let mut degamma_lut = None;
+        let mut degamma_lut_size = None;
+        let mut ctm = None;
+        let mut gamma_lut = None;
+        let mut gamma_lut_size = None;
+
+        for (prop, _) in props {
+            let Ok(info) = device.get_property(prop) else {
+                continue;
+            };
+            let Ok(name) = info.name().to_str() else {
+                continue;
+            };
+
+            match name {
+                "DEGAMMA_LUT" => degamma_lut = Some(prop),
+                "DEGAMMA_LUT_SIZE" => degamma_lut_size = Some(prop),
+                "CTM" => ctm = Some(prop),
+                "GAMMA_LUT" => gamma_lut = Some(prop),
+                "GAMMA_LUT_SIZE" => gamma_lut_size = Some(prop),
+                _ => (),
+            }
+        }
+
+        Some(Self {
+            crtc,
+            degamma_lut: degamma_lut?,
+            degamma_lut_size: degamma_lut_size?,
+            ctm: ctm?,
+            gamma_lut: gamma_lut?,
+            gamma_lut_size: gamma_lut_size?,
+            previous_degamma_blob: None,
+            previous_ctm_blob: None,
+            previous_gamma_blob: None,
+        })
+    }
+
+    fn lut_size(&self, device: &DrmDevice, prop: property::Handle) -> anyhow::Result<u32> {
+        let value =
+            get_drm_property(device, self.crtc, prop).context("missing LUT size property")?;
+        Ok(value as u32)
+    }
+
+    /// Build the CRTC color pipeline properties for HDR:
+    /// DEGAMMA_LUT (sRGB→linear) → CTM (BT.709→monitor gamut) → GAMMA_LUT (linear→PQ).
+    ///
+    /// Returns (property_handle, blob_value) pairs to be set as extra CRTC
+    /// properties on the DrmSurface. They will be applied on the next page flip.
+    fn build_hdr_props(
+        &mut self,
+        device: &DrmDevice,
+        hdr_config: &niri_config::output::HdrConfig,
+    ) -> anyhow::Result<Vec<(property::Handle, u64)>> {
+        use crate::color;
+
+        // --- DEGAMMA LUT: sRGB EOTF ---
+        let degamma_size = self
+            .lut_size(device, self.degamma_lut_size)
+            .context("error getting DEGAMMA_LUT_SIZE")?;
+        let degamma_data = color::generate_srgb_degamma_lut(degamma_size);
+        let degamma_blob = {
+            let mut bytes: Vec<u8> = Vec::with_capacity(degamma_data.len() * 8);
+            for entry in &degamma_data {
+                for &val in entry {
+                    bytes.extend_from_slice(&val.to_ne_bytes());
+                }
+            }
+            let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut bytes)
+                .context("error creating DEGAMMA_LUT blob")?;
+            NonZeroU64::new(u64::from(blob.blob_id))
+        };
+
+        // --- CTM: sRGB/BT.709 → BT.2020 ---
+        // Convert to BT.2020 to match the Colorspace signaling (BT2020_RGB).
+        // The display's EDID primaries are used in HDR_OUTPUT_METADATA for tone
+        // mapping reference, not as the encoding target.
+        let matrix = color::gamut_conversion_matrix(&color::SRGB_PRIMARIES, &color::BT2020_PRIMARIES);
+        let ctm_data = color::matrix_to_drm_ctm(&matrix);
+        let ctm_blob = {
+            let mut bytes = bytemuck::bytes_of(&ctm_data).to_vec();
+            let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut bytes)
+                .context("error creating CTM blob")?;
+            NonZeroU64::new(u64::from(blob.blob_id))
+        };
+
+        // --- GAMMA LUT: linear → PQ ---
+        let gamma_size = self
+            .lut_size(device, self.gamma_lut_size)
+            .context("error getting GAMMA_LUT_SIZE")?;
+        let gamma_data =
+            color::generate_pq_gamma_lut(gamma_size, hdr_config.reference_luminance as f32);
+        let gamma_blob = {
+            let mut bytes: Vec<u8> = Vec::with_capacity(gamma_data.len() * 8);
+            for entry in &gamma_data {
+                for &val in entry {
+                    bytes.extend_from_slice(&val.to_ne_bytes());
+                }
+            }
+            let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut bytes)
+                .context("error creating GAMMA_LUT blob")?;
+            NonZeroU64::new(u64::from(blob.blob_id))
+        };
+
+        let blob_val = |b: Option<NonZeroU64>| -> u64 { b.map(NonZeroU64::get).unwrap_or(0) };
+
+        let props = vec![
+            (self.degamma_lut, blob_val(degamma_blob)),
+            (self.ctm, blob_val(ctm_blob)),
+            (self.gamma_lut, blob_val(gamma_blob)),
+        ];
+
+        // Clean up old blobs and store new ones.
+        self.destroy_old_blobs(device);
+        self.previous_degamma_blob = degamma_blob;
+        self.previous_ctm_blob = ctm_blob;
+        self.previous_gamma_blob = gamma_blob;
+
+        Ok(props)
+    }
+
+    /// Build CRTC properties to reset color pipeline (blob 0 for all).
+    fn build_clear_props(&mut self, device: &DrmDevice) -> Vec<(property::Handle, u64)> {
+        self.destroy_old_blobs(device);
+        self.previous_degamma_blob = None;
+        self.previous_ctm_blob = None;
+        self.previous_gamma_blob = None;
+        vec![
+            (self.degamma_lut, 0),
+            (self.ctm, 0),
+            (self.gamma_lut, 0),
+        ]
+    }
+
+    /// Build CRTC properties to restore the current blobs (for session resume).
+    fn build_restore_props(&self) -> Vec<(property::Handle, u64)> {
+        let blob_val = |b: Option<NonZeroU64>| -> u64 { b.map(NonZeroU64::get).unwrap_or(0) };
+        vec![
+            (self.degamma_lut, blob_val(self.previous_degamma_blob)),
+            (self.ctm, blob_val(self.previous_ctm_blob)),
+            (self.gamma_lut, blob_val(self.previous_gamma_blob)),
+        ]
+    }
+
+    fn destroy_old_blobs(&mut self, device: &DrmDevice) {
+        for blob in [
+            self.previous_degamma_blob.take(),
+            self.previous_ctm_blob.take(),
+            self.previous_gamma_blob.take(),
+        ] {
+            if let Some(blob) = blob {
+                if let Err(err) = device.destroy_property_blob(blob.get()) {
+                    warn!("error destroying CRTC color pipeline blob: {err:?}");
+                }
+            }
+        }
     }
 }
 
@@ -3265,32 +3702,100 @@ impl<'a> ConnectorProperties<'a> {
 }
 
 const DRM_MODE_COLORIMETRY_DEFAULT: u64 = 0;
+const DRM_MODE_COLORIMETRY_BT2020_RGB: u64 = 9;
 
-fn reset_hdr(props: &ConnectorProperties) -> anyhow::Result<()> {
-    let (info, value) = props.find(c"HDR_OUTPUT_METADATA")?;
-    let property::ValueType::Blob = info.value_type() else {
+/// Build HDR connector properties (HDR_OUTPUT_METADATA blob + Colorspace).
+///
+/// Returns a list of (connector, property_handle, raw_value) tuples that should
+/// be set as extra connector properties on the DrmSurface. They will be included
+/// in the next atomic page flip commit, matching what KWin does.
+fn build_hdr_connector_props(
+    props: &ConnectorProperties,
+    edid_color_info: Option<&crate::color::EdidColorInfo>,
+    hdr_config: &niri_config::output::HdrConfig,
+) -> anyhow::Result<Vec<(connector::Handle, property::Handle, u64)>> {
+    // Build the HDR metadata struct.
+    let metadata = crate::color::build_hdr_output_metadata(
+        edid_color_info,
+        hdr_config.max_luminance,
+        hdr_config.min_luminance,
+    );
+
+    // Cast to bytes via bytemuck for the DRM blob.
+    let mut bytes = bytemuck::bytes_of(&metadata).to_vec();
+
+    // Create property blob.
+    let blob = drm_ffi::mode::create_property_blob(props.device.as_fd(), &mut bytes)
+        .context("error creating HDR metadata property blob")?;
+
+    let (hdr_info, _) = props.find(c"HDR_OUTPUT_METADATA")?;
+    let property::ValueType::Blob = hdr_info.value_type() else {
+        bail!("wrong property type for HDR_OUTPUT_METADATA")
+    };
+
+    let mut result = vec![(
+        props.connector,
+        hdr_info.handle(),
+        u64::from(blob.blob_id),
+    )];
+
+    // Look up Colorspace BT2020_RGB value.
+    if let Some((cs_handle, cs_val)) = find_colorspace_bt2020_value(props) {
+        result.push((props.connector, cs_handle, cs_val));
+    }
+
+    Ok(result)
+}
+
+/// Find the Colorspace property handle and BT2020_RGB enum value.
+fn find_colorspace_bt2020_value(
+    props: &ConnectorProperties,
+) -> Option<(property::Handle, u64)> {
+    let (info, _) = props.find(c"Colorspace").ok()?;
+    let property::ValueType::Enum(entries) = info.value_type() else {
+        return None;
+    };
+
+    let (_raw_values, enums) = entries.values();
+    for entry in enums {
+        if entry.name().to_str() == Ok("BT2020_RGB") {
+            return Some((info.handle(), entry.value()));
+        }
+    }
+
+    // Fall back to the well-known kernel constant.
+    Some((info.handle(), DRM_MODE_COLORIMETRY_BT2020_RGB))
+}
+
+/// Build connector properties to reset HDR (blob=0, colorspace=default).
+/// Returns properties to set on the DrmSurface, or empty vec if no reset needed.
+fn build_hdr_reset_props(
+    props: &ConnectorProperties,
+) -> anyhow::Result<Vec<(connector::Handle, property::Handle, u64)>> {
+    let (hdr_info, hdr_value) = props.find(c"HDR_OUTPUT_METADATA")?;
+    let property::ValueType::Blob = hdr_info.value_type() else {
         bail!("wrong property type")
     };
 
-    if *value != 0 {
-        props
-            .device
-            .set_property(props.connector, info.handle(), 0)
-            .context("error setting property")?;
-    }
-
-    let (info, value) = props.find(c"Colorspace")?;
-    let property::ValueType::Enum(_) = info.value_type() else {
+    let (cs_info, cs_value) = props.find(c"Colorspace")?;
+    let property::ValueType::Enum(_) = cs_info.value_type() else {
         bail!("wrong property type")
     };
-    if *value != DRM_MODE_COLORIMETRY_DEFAULT {
-        props
-            .device
-            .set_property(props.connector, info.handle(), DRM_MODE_COLORIMETRY_DEFAULT)
-            .context("error setting property")?;
+
+    let mut result = Vec::new();
+
+    if *hdr_value != 0 {
+        result.push((props.connector, hdr_info.handle(), 0u64));
+    }
+    if *cs_value != DRM_MODE_COLORIMETRY_DEFAULT {
+        result.push((
+            props.connector,
+            cs_info.handle(),
+            DRM_MODE_COLORIMETRY_DEFAULT,
+        ));
     }
 
-    Ok(())
+    Ok(result)
 }
 
 fn is_vrr_capable(device: &DrmDevice, connector: connector::Handle) -> Option<bool> {

@@ -1016,6 +1016,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1925,6 +1931,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
+name = "lcms2"
+version = "6.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b75877b724685dd49310bdbadbf973fc69b1d01992a6d4a861b928fc3943f87b"
+dependencies = [
+ "bytemuck",
+ "foreign-types",
+ "lcms2-sys",
+]
+
+[[package]]
+name = "lcms2-sys"
+version = "4.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c2604b23848ca80b2add60f0fb2270fd980e622c25029b6597fa01cfd5f8d5f"
+dependencies = [
+ "cc",
+ "dunce",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2261,6 +2290,7 @@ dependencies = [
  "input",
  "insta",
  "keyframe",
+ "lcms2",
  "libc",
  "libdisplay-info",
  "log",
@@ -3498,7 +3528,7 @@ checksum = "b7c388c1b5e93756d0c740965c41e8822f866621d41acbdf6336a6a168f8840c"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/Smithay/smithay.git?rev=ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef#ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+source = "git+https://github.com/apsyx/smithay.git?rev=636e029f6cb2746d0a13f66a92ad008b91832cb8#636e029f6cb2746d0a13f66a92ad008b91832cb8"
 dependencies = [
  "aliasable",
  "appendlist",
@@ -3573,7 +3603,7 @@ dependencies = [
 [[package]]
 name = "smithay-drm-extras"
 version = "0.1.0"
-source = "git+https://github.com/Smithay/smithay.git?rev=ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef#ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+source = "git+https://github.com/apsyx/smithay.git?rev=636e029f6cb2746d0a13f66a92ad008b91832cb8#636e029f6cb2746d0a13f66a92ad008b91832cb8"
 dependencies = [
  "drm",
  "libdisplay-info",
@@ -4136,8 +4166,7 @@ dependencies = [
 [[package]]
 name = "wayland-backend"
 version = "0.3.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2857dd20b54e916ec7253b3d6b4d5c4d7d4ca2c33c2e11c6c76a99bd8744755d"
+source = "git+https://github.com/apsyx/wayland-backend-patched.git?branch=wayland-backend-0.3.15#aaf8b128d0001af393f3b1d8330dde3a968d307a"
 dependencies = [
  "cc",
  "downcast-rs",

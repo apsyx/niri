@@ -54,7 +54,7 @@ pub use crate::input::{Input, ModKey, ScrollMethod, TrackLayout, WarpMouseToFocu
 pub use crate::layer_rule::LayerRule;
 pub use crate::layout::*;
 pub use crate::misc::*;
-pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
+pub use crate::output::{ColorDepth, Output, OutputName, Outputs, Position, Vrr};
 use crate::recent_windows::RecentWindowsPart;
 pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
 pub use crate::utils::FloatOrInt;
@@ -1186,6 +1186,8 @@ mod tests {
                             },
                         ),
                         backdrop_color: None,
+                        color_depth: None,
+                        icc_profile: None,
                         hot_corners: Some(
                             HotCorners {
                                 off: true,
@@ -1196,6 +1198,7 @@ mod tests {
                             },
                         ),
                         layout: None,
+                        hdr: None,
                     },
                     Output {
                         off: false,
@@ -1220,8 +1223,11 @@ mod tests {
                         focus_at_startup: false,
                         background_color: None,
                         backdrop_color: None,
+                        color_depth: None,
+                        icc_profile: None,
                         hot_corners: None,
                         layout: None,
+                        hdr: None,
                     },
                     Output {
                         off: false,
@@ -1249,8 +1255,11 @@ mod tests {
                         focus_at_startup: false,
                         background_color: None,
                         backdrop_color: None,
+                        color_depth: None,
+                        icc_profile: None,
                         hot_corners: None,
                         layout: None,
+                        hdr: None,
                     },
                 ],
             ),
